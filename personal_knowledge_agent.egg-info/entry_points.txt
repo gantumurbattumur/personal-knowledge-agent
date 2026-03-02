@@ -1,0 +1,2 @@
+[console_scripts]
+pka = personal_knowledge_agent.cli:app

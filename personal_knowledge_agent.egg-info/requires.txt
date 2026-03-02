@@ -1,0 +1,23 @@
+typer>=0.12.0
+rich>=13.7.0
+
+[:python_version < "3.11"]
+tomli>=2.0.1
+
+[epub]
+ebooklib>=0.18
+beautifulsoup4>=4.12.0
+
+[full]
+pypdf>=4.2.0
+ebooklib>=0.18
+beautifulsoup4>=4.12.0
+sentence-transformers>=3.0.0
+numpy>=1.26.0
+
+[pdf]
+pypdf>=4.2.0
+
+[retrieval]
+sentence-transformers>=3.0.0
+numpy>=1.26.0
