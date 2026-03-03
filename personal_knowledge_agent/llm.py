@@ -31,10 +31,12 @@ def generate_answer(settings: Settings, question: str, evidence: str) -> str:
     provider = settings.llm_provider
     if provider == "none":
         return evidence
-    if provider == "ollama":
+    if provider in {"ollama", "local"}:
         return _answer_ollama(settings, question, evidence)
     if provider == "openai":
         return _answer_openai(settings, question, evidence)
+    if provider == "anthropic":
+        return evidence
     return evidence
 
 

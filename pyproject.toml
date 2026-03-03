@@ -11,23 +11,43 @@ requires-python = ">=3.10"
 dependencies = [
   "typer>=0.12.0",
   "rich>=13.7.0",
+  "pydantic>=2.7.0",
   "tomli>=2.0.1; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
 pdf = ["pypdf>=4.2.0"]
+multimodal = ["docling>=2.0.0", "pypdf>=4.2.0"]
 epub = ["ebooklib>=0.18", "beautifulsoup4>=4.12.0"]
 retrieval = ["sentence-transformers>=3.0.0", "numpy>=1.26.0"]
+vectordb = ["lancedb>=0.12.0", "pyarrow>=17.0.0"]
+gdrive = ["gdown>=5.2.0"]
+auth = ["keyring>=25.0.0"]
+connectors = [
+  "google-auth-oauthlib>=1.2.0",
+  "google-api-python-client>=2.149.0",
+  "google-auth>=2.35.0",
+  "keyring>=25.0.0",
+]
 full = [
   "pypdf>=4.2.0",
+  "docling>=2.0.0",
   "ebooklib>=0.18",
   "beautifulsoup4>=4.12.0",
   "sentence-transformers>=3.0.0",
   "numpy>=1.26.0",
+  "lancedb>=0.12.0",
+  "pyarrow>=17.0.0",
+  "gdown>=5.2.0",
+  "google-auth-oauthlib>=1.2.0",
+  "google-api-python-client>=2.149.0",
+  "google-auth>=2.35.0",
+  "keyring>=25.0.0",
 ]
 
 [project.scripts]
 pka = "personal_knowledge_agent.cli:app"
+ai = "personal_knowledge_agent.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["."]

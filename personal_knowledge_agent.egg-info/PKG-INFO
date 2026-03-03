@@ -6,21 +6,45 @@ Requires-Python: >=3.10
 Description-Content-Type: text/markdown
 Requires-Dist: typer>=0.12.0
 Requires-Dist: rich>=13.7.0
+Requires-Dist: pydantic>=2.7.0
 Requires-Dist: tomli>=2.0.1; python_version < "3.11"
 Provides-Extra: pdf
 Requires-Dist: pypdf>=4.2.0; extra == "pdf"
+Provides-Extra: multimodal
+Requires-Dist: docling>=2.0.0; extra == "multimodal"
+Requires-Dist: pypdf>=4.2.0; extra == "multimodal"
 Provides-Extra: epub
 Requires-Dist: ebooklib>=0.18; extra == "epub"
 Requires-Dist: beautifulsoup4>=4.12.0; extra == "epub"
 Provides-Extra: retrieval
 Requires-Dist: sentence-transformers>=3.0.0; extra == "retrieval"
 Requires-Dist: numpy>=1.26.0; extra == "retrieval"
+Provides-Extra: vectordb
+Requires-Dist: lancedb>=0.12.0; extra == "vectordb"
+Requires-Dist: pyarrow>=17.0.0; extra == "vectordb"
+Provides-Extra: gdrive
+Requires-Dist: gdown>=5.2.0; extra == "gdrive"
+Provides-Extra: auth
+Requires-Dist: keyring>=25.0.0; extra == "auth"
+Provides-Extra: connectors
+Requires-Dist: google-auth-oauthlib>=1.2.0; extra == "connectors"
+Requires-Dist: google-api-python-client>=2.149.0; extra == "connectors"
+Requires-Dist: google-auth>=2.35.0; extra == "connectors"
+Requires-Dist: keyring>=25.0.0; extra == "connectors"
 Provides-Extra: full
 Requires-Dist: pypdf>=4.2.0; extra == "full"
+Requires-Dist: docling>=2.0.0; extra == "full"
 Requires-Dist: ebooklib>=0.18; extra == "full"
 Requires-Dist: beautifulsoup4>=4.12.0; extra == "full"
 Requires-Dist: sentence-transformers>=3.0.0; extra == "full"
 Requires-Dist: numpy>=1.26.0; extra == "full"
+Requires-Dist: lancedb>=0.12.0; extra == "full"
+Requires-Dist: pyarrow>=17.0.0; extra == "full"
+Requires-Dist: gdown>=5.2.0; extra == "full"
+Requires-Dist: google-auth-oauthlib>=1.2.0; extra == "full"
+Requires-Dist: google-api-python-client>=2.149.0; extra == "full"
+Requires-Dist: google-auth>=2.35.0; extra == "full"
+Requires-Dist: keyring>=25.0.0; extra == "full"
 
 # personal-knowledge-agent
 
@@ -39,15 +63,21 @@ Terminal-first personal RAG assistant for developers.
 ## Quick start
 
 ```bash
-python3 -m venv .venv
+uv venv .venv
 source .venv/bin/activate
-pip install -e .
+uv pip install -e .
 ```
 
 Install full ingestion + hybrid retrieval extras:
 
 ```bash
-pip install -e .[full]
+uv pip install -e .[full]
+```
+
+Install only Google Drive support:
+
+```bash
+uv pip install -e .[gdrive]
 ```
 
 Initialize config:
@@ -86,6 +116,24 @@ Ask using lexical-only fallback:
 pka ask "What did I write about retrieval evaluation?" --mode lexical
 ```
 
+## Google Drive books workflow
+
+Sync a public Google Drive folder into local cache:
+
+```bash
+uv run pka drive-sync "https://drive.google.com/drive/folders/<FOLDER_ID>?usp=sharing"
+```
+
+Sync + index in one command:
+
+```bash
+uv run pka drive-index "https://drive.google.com/drive/folders/<FOLDER_ID>?usp=sharing"
+```
+
+By default files are stored under `~/.pka/sources/google-drive`.
+
+Run `drive-index` repeatedly as you update your Drive folder; indexing is incremental.
+
 ## LLM modes
 
 - `none` (default): extractive grounded answer from retrieved chunks
@@ -103,8 +151,18 @@ Set provider in `~/.pka/config.toml`.
 Dense/hybrid requires optional dependency set:
 
 ```bash
-pip install -e .[retrieval]
+uv pip install -e .[retrieval]
 ```
+
+## Vector database status
+
+Current implementation uses SQLite as local storage:
+
+- FTS5 table for lexical retrieval
+- `chunk_embeddings` table storing dense vectors as blobs
+- Dense retrieval uses in-process cosine similarity scan
+
+This is local vector storage in SQLite, not an external dedicated vector database yet.
 
 Default retrieval config in `~/.pka/config.toml`:
 

@@ -7,31 +7,20 @@ from .config import Settings
 from .context import collect_workflow_context
 from .index_store import IndexStore
 from .schemas import RetrievalResult, WorkflowContext
+from .vector_store import LanceVectorStore
 
 
-def _normalize_scores(values: list[float]) -> list[float]:
-    if not values:
-        return []
-    min_v = min(values)
-    max_v = max(values)
-    if max_v - min_v <= 1e-9:
-        return [1.0 for _ in values]
-    return [(value - min_v) / (max_v - min_v) for value in values]
-
-
-def _fuse_results(
+def _fuse_results_rrf(
     lexical: list[RetrievalResult],
     dense: list[RetrievalResult],
     top_k: int,
-    lexical_weight: float = 0.55,
-    dense_weight: float = 0.45,
+    rrf_k: int = 60,
+    lexical_weight: float = 1.0,
+    dense_weight: float = 1.0,
 ) -> list[RetrievalResult]:
-    lexical_norm = _normalize_scores([item.score for item in lexical])
-    dense_norm = _normalize_scores([item.score for item in dense])
-
     by_chunk: dict[str, RetrievalResult] = {}
 
-    for item, score in zip(lexical, lexical_norm):
+    for rank, item in enumerate(lexical, start=1):
         existing = by_chunk.get(item.chunk_id)
         if not existing:
             existing = RetrievalResult(
@@ -41,11 +30,14 @@ def _fuse_results(
                 section=item.section,
                 text=item.text,
                 score=0.0,
+                source_branch=item.source_branch,
+                cloud_url=item.cloud_url,
             )
             by_chunk[item.chunk_id] = existing
-        existing.lexical_score = score
+        existing.lexical_score = item.score
+        existing.score += lexical_weight * (1.0 / (rrf_k + rank))
 
-    for item, score in zip(dense, dense_norm):
+    for rank, item in enumerate(dense, start=1):
         existing = by_chunk.get(item.chunk_id)
         if not existing:
             existing = RetrievalResult(
@@ -55,27 +47,50 @@ def _fuse_results(
                 section=item.section,
                 text=item.text,
                 score=0.0,
+                source_branch=item.source_branch,
+                cloud_url=item.cloud_url,
             )
             by_chunk[item.chunk_id] = existing
-        existing.dense_score = score
+        existing.dense_score = item.score
+        existing.score += dense_weight * (1.0 / (rrf_k + rank))
 
     fused = list(by_chunk.values())
-    for item in fused:
-        item.score = (item.lexical_score * lexical_weight) + (item.dense_score * dense_weight)
-    fused.sort(key=lambda result: result.score, reverse=True)
+    for result in fused:
+        result.selected_reason = "hybrid_rrf"
+    fused.sort(key=_stable_sort_key)
     return fused[:top_k]
 
 
+def _stable_sort_key(item: RetrievalResult) -> tuple:
+    return (
+        -item.score,
+        item.source_path,
+        item.page_number if item.page_number is not None else 10**9,
+        item.section,
+        item.chunk_id,
+    )
+
+
 def _apply_context_boost(context: WorkflowContext, results: list[RetrievalResult]) -> None:
-    if context.git_branch:
-        branch_terms = [term for term in context.git_branch.replace("/", " ").split() if len(term) > 2]
-        if branch_terms:
-            boost_set = set(branch_terms)
-            for result in results:
-                haystack = f"{result.title} {result.section} {result.text[:350]}".lower()
-                matched = sum(1 for term in boost_set if term.lower() in haystack)
-                if matched:
-                    result.score += matched * 0.25
+    cwd = Path(context.cwd).expanduser().resolve()
+
+    for result in results:
+        in_cwd = False
+        in_branch = False
+
+        try:
+            source = Path(result.source_path).expanduser().resolve()
+            in_cwd = source.is_relative_to(cwd)
+        except Exception:
+            in_cwd = False
+
+        if context.git_branch and result.source_branch:
+            in_branch = context.git_branch.strip().lower() == result.source_branch.strip().lower()
+
+        if in_cwd or in_branch:
+            result.workflow_boost = 1.5
+            result.score *= result.workflow_boost
+            result.selected_reason = "workflow_boost"
 
 
 def _maybe_rerank(
@@ -101,12 +116,15 @@ def _maybe_rerank(
         item.score = (item.score * 0.6) + (rerank_score * 0.4)
 
     combined = subset + results[max_rerank:]
-    combined.sort(key=lambda item: item.score, reverse=True)
+    for item in subset:
+        item.selected_reason = "reranked"
+    combined.sort(key=_stable_sort_key)
     return combined
 
 
 def retrieve_with_context(
     store: IndexStore,
+    vector_store: LanceVectorStore | None,
     query: str,
     cwd: Path,
     top_k: int,
@@ -125,27 +143,39 @@ def retrieve_with_context(
         engine = EmbeddingEngine(settings.embedding_model)
         query_vector = engine.encode_query(query) if engine.status.enabled else None
         if query_vector is not None:
-            dense_results = store.dense_search(query_vector, embedding_model=settings.embedding_model, top_k=max(top_k * 3, 20))
+            if vector_store and vector_store.enabled:
+                dense_results = vector_store.search(
+                    query_vector,
+                    embedding_model=settings.embedding_model,
+                    top_k=max(top_k * 3, 20),
+                )
+            else:
+                dense_results = store.dense_search(query_vector, embedding_model=settings.embedding_model, top_k=max(top_k * 3, 20))
         elif mode == "dense":
             lexical_results = store.search(query, top_k=max(top_k * 3, 20))
             mode = "lexical"
 
     if mode == "lexical":
         results = lexical_results[:top_k]
+        for item in results:
+            item.selected_reason = "lexical"
     elif mode == "dense":
         results = dense_results[:top_k]
+        for item in results:
+            item.selected_reason = "dense"
     else:
-        results = _fuse_results(lexical_results, dense_results, top_k=top_k)
+        results = _fuse_results_rrf(lexical_results, dense_results, top_k=top_k)
 
     _apply_context_boost(context, results)
-    results.sort(key=lambda r: r.score, reverse=True)
+    results.sort(key=_stable_sort_key)
     results = _maybe_rerank(query, results, settings, max_rerank=min(top_k, 12))
+    results.sort(key=_stable_sort_key)
     return context, results[:top_k], mode
 
 
 def build_extractive_answer(query: str, results: list[RetrievalResult], max_snippets: int = 4) -> str:
     if not results:
-        return "No grounded evidence found in the local index. Try `pka index <path>` or adjust your query."
+        return "No grounded evidence found in the local index. Try `ai index <path>` or adjust your query."
 
     chosen = results[:max_snippets]
     lines = [f"Question: {query}", "", "Grounded evidence:"]
@@ -157,11 +187,37 @@ def build_extractive_answer(query: str, results: list[RetrievalResult], max_snip
     return "\n".join(lines)
 
 
+def compress_results_context(results: list[RetrievalResult], max_chars: int = 2600) -> tuple[str, list[str]]:
+    consumed = 0
+    snippets: list[str] = []
+    used_chunks: list[str] = []
+    for item in results:
+        snippet = " ".join(item.text.split())
+        if len(snippet) > 320:
+            snippet = snippet[:320].rstrip() + "…"
+        if consumed + len(snippet) > max_chars and snippets:
+            break
+        snippets.append(snippet)
+        used_chunks.append(item.chunk_id)
+        consumed += len(snippet)
+    return "\n\n".join(snippets), used_chunks
+
+
 def format_references(results: list[RetrievalResult], max_refs: int = 8) -> list[str]:
     refs: list[str] = []
     for item in results[:max_refs]:
+        link = item.source_url or item.cloud_url or item.source_path
+        location: list[str] = []
+        if item.page_number is not None:
+            location.append(f"page {item.page_number}")
+        if item.slide_number is not None:
+            location.append(f"slide {item.slide_number}")
+        if item.section_heading or item.section:
+            location.append(item.section_heading or item.section)
+        location_text = ", ".join(location) if location else "location n/a"
         refs.append(
-            f"{item.source_path} | {item.section} | chunk={item.chunk_id} | "
-            f"score={item.score:.3f} (lex={item.lexical_score:.3f}, dense={item.dense_score:.3f}, rerank={item.rerank_score:.3f})"
+            f"{link} | {location_text} | chunk={item.chunk_id} | "
+            f"score={item.score:.3f} boost={item.workflow_boost:.2f} "
+            f"(lex={item.lexical_score:.3f}, dense={item.dense_score:.3f}, rerank={item.rerank_score:.3f})"
         )
     return refs

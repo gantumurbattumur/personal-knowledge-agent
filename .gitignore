@@ -2,3 +2,10 @@
 __pycache__/
 *.pyc
 .pka/
+
+# Personal Knowledge Agent
+.env
+.pka/cache/
+.pka/logs/
+.pka/vectorstore/
+.pka/index.sqlite3

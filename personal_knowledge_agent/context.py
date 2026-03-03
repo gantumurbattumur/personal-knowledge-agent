@@ -18,6 +18,22 @@ def git_branch(cwd: Path) -> str | None:
     return _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd)
 
 
+def git_root(cwd: Path) -> Path | None:
+    root = _run(["git", "rev-parse", "--show-toplevel"], cwd)
+    if not root:
+        return None
+    return Path(root).expanduser().resolve()
+
+
+def discover_project_root(cwd: Path, prefer_git: bool = True) -> Path:
+    cwd = cwd.expanduser().resolve()
+    if prefer_git:
+        root = git_root(cwd)
+        if root:
+            return root
+    return cwd
+
+
 def recent_project_files(cwd: Path, limit: int = 10) -> list[str]:
     files = [p for p in cwd.rglob("*") if p.is_file() and ".git" not in p.parts]
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -33,8 +49,13 @@ def recent_project_files(cwd: Path, limit: int = 10) -> list[str]:
 
 
 def collect_workflow_context(cwd: Path, recent_limit: int = 10) -> WorkflowContext:
+    resolved_cwd = cwd.expanduser().resolve()
+    resolved_git_root = git_root(resolved_cwd)
+    project_root = discover_project_root(resolved_cwd, prefer_git=True)
     return WorkflowContext(
-        cwd=str(cwd),
-        git_branch=git_branch(cwd),
-        recent_files=recent_project_files(cwd, limit=recent_limit),
+        cwd=str(resolved_cwd),
+        project_root=str(project_root),
+        git_root=str(resolved_git_root) if resolved_git_root else None,
+        git_branch=git_branch(resolved_cwd),
+        recent_files=recent_project_files(project_root, limit=recent_limit),
     )

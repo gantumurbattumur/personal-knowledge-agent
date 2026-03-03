@@ -1,16 +1,20 @@
 # personal-knowledge-agent
 
-Terminal-first personal RAG assistant for developers.
+Workflow-aware, local-first terminal RAG assistant for developers.
 
 ## Features (v1 scaffold)
 
 - Local ingestion for Markdown, code/text files, PDF, and EPUB
+- Project-local storage under `.pka/` (SQLite metadata + LanceDB vectors)
 - Incremental chunk indexing into SQLite + FTS5
-- Optional dense embeddings + hybrid retrieval fusion
+- Optional dense embeddings + hybrid retrieval fusion (RRF)
 - Optional reranking for top candidates
-- Project workflow context capture (cwd, git branch, recent files)
+- Project workflow context capture (cwd, git root, git branch, recent files)
+- Workflow-aware score boosting (+50% for CWD / matching branch sources)
+- Cloud connectors: Google Drive incremental sync (version checks), Notion markdown sync
+- Docling-first PDF extraction; optional image/chart captioning is file-based (no camera capture)
 - Grounded retrieval with source references
-- Terminal CLI for index/search/ask/doctor/trace
+- Terminal CLI for `ai init`, `ai auth`, `ai sync`, `ai ask`, `ai doctor`, `ai trace`
 
 ## Quick start
 
@@ -20,47 +24,107 @@ source .venv/bin/activate
 uv pip install -e .
 ```
 
+Install workflow + connector stack:
+
+```bash
+uv pip install -e .[full]
+```
+
 Install full ingestion + hybrid retrieval extras:
 
 ```bash
 uv pip install -e .[full]
 ```
 
-Initialize config:
+Install only Google Drive support:
 
 ```bash
-pka config init
+uv pip install -e .[gdrive]
+```
+
+Initialize project-local config and env:
+
+```bash
+ai init
 ```
 
 Index your project/documents:
 
 ```bash
-pka index .
+ai index .
 ```
 
 Search the index:
 
 ```bash
-pka search "colbert reranking"
+ai search "colbert reranking"
 ```
 
 Search with explicit mode override:
 
 ```bash
-pka search "colbert reranking" --mode hybrid
+ai search "colbert reranking" --mode hybrid
 ```
 
 Ask a grounded question:
 
 ```bash
-pka ask "What did I write about retrieval evaluation?"
+ai ask "What did I write about retrieval evaluation?"
 ```
 
 Ask using lexical-only fallback:
 
 ```bash
-pka ask "What did I write about retrieval evaluation?" --mode lexical
+ai ask "What did I write about retrieval evaluation?" --mode lexical
 ```
+
+## Cloud auth and sync
+
+Authenticate connectors (tokens stored in system keyring):
+
+```bash
+ai auth google-drive --client-secret-file client_secret.json
+```
+
+For Notion, first print authorization URL, then exchange code:
+
+```bash
+ai auth notion --client-id <id>
+ai auth notion --client-id <id> --client-secret <secret> --code <oauth_code>
+```
+
+Run incremental sync:
+
+```bash
+ai sync
+```
+
+`ai sync` reads `.env` keys:
+
+- `GOOGLE_DRIVE_FOLDER_ID`
+- `GOOGLE_DRIVE_DEST` (default `.pka/sources/google-drive`)
+- `NOTION_ROOT_PAGE_ID`
+- `NOTION_DEST` (default `.pka/sources/notion`)
+
+Only changed cloud documents are pulled (Google Drive by `version`, Notion by `last_edited_time`). Synced files are indexed automatically.
+
+## Google Drive legacy public-folder workflow
+
+Sync a public Google Drive folder into local cache:
+
+```bash
+uv run pka drive-sync "https://drive.google.com/drive/folders/<FOLDER_ID>?usp=sharing"
+```
+
+Sync + index in one command:
+
+```bash
+uv run pka drive-index "https://drive.google.com/drive/folders/<FOLDER_ID>?usp=sharing"
+```
+
+By default files are stored under `.pka/sources/google-drive`.
+
+Run `drive-index` repeatedly as you update your Drive folder; indexing is incremental.
 
 ## LLM modes
 
@@ -68,7 +132,7 @@ pka ask "What did I write about retrieval evaluation?" --mode lexical
 - `ollama`: calls local Ollama (`OLLAMA_BASE_URL`, `OLLAMA_MODEL`)
 - `openai`: calls OpenAI Chat Completions (`OPENAI_API_KEY`, `OPENAI_MODEL`)
 
-Set provider in `~/.pka/config.toml`.
+Set provider in `.pka/config.toml`.
 
 ## Retrieval modes
 
@@ -82,7 +146,17 @@ Dense/hybrid requires optional dependency set:
 uv pip install -e .[retrieval]
 ```
 
-Default retrieval config in `~/.pka/config.toml`:
+## Vector database status
+
+Current implementation uses SQLite as local storage:
+
+- FTS5 table for lexical retrieval
+- `chunk_embeddings` table storing dense vectors as blobs
+- Dense retrieval uses in-process cosine similarity scan
+
+This is local vector storage in SQLite, not an external dedicated vector database yet.
+
+Default retrieval config in `.pka/config.toml`:
 
 ```toml
 [retrieval]
