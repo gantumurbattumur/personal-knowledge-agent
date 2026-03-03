@@ -175,7 +175,7 @@ def retrieve_with_context(
 
 def build_extractive_answer(query: str, results: list[RetrievalResult], max_snippets: int = 4) -> str:
     if not results:
-        return "No grounded evidence found in the local index. Try `ai index <path>` or adjust your query."
+        return "No grounded evidence found in the local index. Try `rag index <path>` or adjust your query."
 
     chosen = results[:max_snippets]
     lines = [f"Question: {query}", "", "Grounded evidence:"]

@@ -232,6 +232,11 @@ def index_alias(path: str = typer.Argument(".")) -> None:
     rag_build(path)
 
 
+@app.command("build")
+def build_alias(path: str = typer.Argument(".")) -> None:
+    rag_build(path)
+
+
 @app.command("auth")
 def auth(
     service: str = typer.Argument(..., help="google-drive | notion"),
@@ -304,7 +309,7 @@ def sync() -> None:
     if folder_id:
         token_payload = load_token("google-drive")
         if not token_payload:
-            raise typer.BadParameter("Google Drive is not authenticated. Run: ai auth google-drive")
+            raise typer.BadParameter("Google Drive is not authenticated. Run: rag auth google-drive")
         with _store() as store:
             store.upsert_source_connection(
                 source_type="google_drive",
@@ -327,7 +332,7 @@ def sync() -> None:
     if notion_root_page_id:
         token_payload = load_token("notion")
         if not token_payload:
-            raise typer.BadParameter("Notion is not authenticated. Run: ai auth notion")
+            raise typer.BadParameter("Notion is not authenticated. Run: rag auth notion")
         with _store() as store:
             store.upsert_source_connection(
                 source_type="notion",
@@ -350,7 +355,7 @@ def sync() -> None:
     for sync_path in sync_paths:
         rag_build(path=str(sync_path))
 
-    table = Table(title="AI Sync")
+    table = Table(title="RAG Sync")
     table.add_column("Connector")
     table.add_column("Status")
     table.add_row("google-drive", drive_summary)
@@ -472,6 +477,11 @@ def rag_status() -> None:
     else:
         by_source.add_row("-", "0", "0")
     console.print(by_source)
+
+
+@app.command("status")
+def status_alias() -> None:
+    rag_status()
 
 
 @app.command()
@@ -690,21 +700,21 @@ def info() -> None:
     console.print(
         Panel.fit(
             f"version: 0.1.0\npython: {sys.version.split()[0]}\nplatform: {platform.platform()}\nproject_root: {settings.project_root}",
-            title="AI Info",
+            title="RAG Info",
         )
     )
 
     usage = Table(title="Unified Command Usage")
     usage.add_column("Command")
     usage.add_column("Description")
-    usage.add_row("ai init", "Initialize .env, .gitignore, and .pka/ skeleton")
-    usage.add_row("ai sources connect <type>", "Connect local/google_drive/notion source")
-    usage.add_row("ai sync", "Sync connected cloud sources")
-    usage.add_row("ai rag build [path]", "Build/update local index")
-    usage.add_row("ai rag status", "Show index stats and source breakdown")
-    usage.add_row("ai ask \"question\" [--debug]", "Grounded answer with citations")
-    usage.add_row("ai search \"query\"", "Retrieval-only lookup")
-    usage.add_row("ai doctor", "System health and configuration checks")
+    usage.add_row("rag init", "Initialize .env, .gitignore, and .pka/ skeleton")
+    usage.add_row("rag sources connect <type>", "Connect local/google_drive/notion source")
+    usage.add_row("rag sync", "Sync connected cloud sources")
+    usage.add_row("rag build [path]", "Build/update local index")
+    usage.add_row("rag status", "Show index stats and source breakdown")
+    usage.add_row("rag ask \"question\" [--debug]", "Grounded answer with citations")
+    usage.add_row("rag search \"query\"", "Retrieval-only lookup")
+    usage.add_row("rag doctor", "System health and configuration checks")
     console.print(usage)
 
     connected = Table(title="Connected Services")

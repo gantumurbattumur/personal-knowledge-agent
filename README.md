@@ -14,7 +14,7 @@ Workflow-aware, local-first terminal RAG assistant for developers.
 - Cloud connectors: Google Drive incremental sync (version checks), Notion markdown sync
 - Docling-first PDF extraction; optional image/chart captioning is file-based (no camera capture)
 - Grounded retrieval with source references
-- Terminal CLI for `ai init`, `ai auth`, `ai sync`, `ai ask`, `ai doctor`, `ai trace`
+- Terminal CLI for `rag init`, `rag auth`, `rag sync`, `rag ask`, `rag doctor`, `rag trace`
 
 ## Quick start
 
@@ -45,37 +45,37 @@ uv pip install -e .[gdrive]
 Initialize project-local config and env:
 
 ```bash
-ai init
+rag init
 ```
 
 Index your project/documents:
 
 ```bash
-ai index .
+rag index .
 ```
 
 Search the index:
 
 ```bash
-ai search "colbert reranking"
+rag search "colbert reranking"
 ```
 
 Search with explicit mode override:
 
 ```bash
-ai search "colbert reranking" --mode hybrid
+rag search "colbert reranking" --mode hybrid
 ```
 
 Ask a grounded question:
 
 ```bash
-ai ask "What did I write about retrieval evaluation?"
+rag ask "What did I write about retrieval evaluation?"
 ```
 
 Ask using lexical-only fallback:
 
 ```bash
-ai ask "What did I write about retrieval evaluation?" --mode lexical
+rag ask "What did I write about retrieval evaluation?" --mode lexical
 ```
 
 ## Cloud auth and sync
@@ -83,23 +83,23 @@ ai ask "What did I write about retrieval evaluation?" --mode lexical
 Authenticate connectors (tokens stored in system keyring):
 
 ```bash
-ai auth google-drive --client-secret-file client_secret.json
+rag auth google-drive --client-secret-file client_secret.json
 ```
 
 For Notion, first print authorization URL, then exchange code:
 
 ```bash
-ai auth notion --client-id <id>
-ai auth notion --client-id <id> --client-secret <secret> --code <oauth_code>
+rag auth notion --client-id <id>
+rag auth notion --client-id <id> --client-secret <secret> --code <oauth_code>
 ```
 
 Run incremental sync:
 
 ```bash
-ai sync
+rag sync
 ```
 
-`ai sync` reads `.env` keys:
+`rag sync` reads `.env` keys:
 
 - `GOOGLE_DRIVE_FOLDER_ID`
 - `GOOGLE_DRIVE_DEST` (default `.pka/sources/google-drive`)
