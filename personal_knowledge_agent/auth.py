@@ -92,7 +92,7 @@ def auth_notion(client_id: str, client_secret: str, redirect_uri: str, code: str
     return AuthResult(ok=True, service="notion", message="Notion auth completed and token saved to keyring")
 
 
-def notion_authorize_url(client_id: str, redirect_uri: str, state: str = "pka") -> str:
+def notion_authorize_url(client_id: str, redirect_uri: str, state: str = "rag") -> str:
     params = parse.urlencode(
         {
             "client_id": client_id,

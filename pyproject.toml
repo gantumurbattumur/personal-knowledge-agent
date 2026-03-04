@@ -58,7 +58,6 @@ full = [
 ]
 
 [project.scripts]
-pka = "personal_knowledge_agent.cli:app"
 rag = "personal_knowledge_agent.cli:app"
 
 [tool.setuptools.packages.find]

@@ -186,7 +186,7 @@ def config(
         return
 
     settings = load_settings()
-    table = Table(title="PKA Config")
+    table = Table(title="RAG Config")
     table.add_column("Key")
     table.add_column("Value")
     table.add_row("config_path", str(settings.config_path))
@@ -849,7 +849,7 @@ def trace(limit: int = typer.Option(10, min=1, max=100)) -> None:
 @app.command()
 def doctor() -> None:
     settings = load_settings()
-    status_table = Table(title="PKA Doctor")
+    status_table = Table(title="RAG Doctor")
     status_table.add_column("Check")
     status_table.add_column("Result")
 
