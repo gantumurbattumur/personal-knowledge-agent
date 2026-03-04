@@ -1,244 +1,123 @@
 # personal-knowledge-agent
 
-Workflow-aware, local-first terminal RAG assistant for developers.
+Workspace-aware, local-first RAG assistant for developers.
 
-## Features (v1 scaffold)
+## Version 2 (V2)
 
-- Local ingestion for Markdown, code/text files, PDF, and EPUB
-- Project-local storage under `.pka/` (SQLite metadata + LanceDB vectors)
-- Incremental chunk indexing into SQLite + FTS5
-- Optional dense embeddings + hybrid retrieval fusion (RRF)
-- Optional reranking for top candidates
-- Project workflow context capture (cwd, git root, git branch, recent files)
-- Workflow-aware score boosting (+50% for CWD / matching branch sources)
-- Cloud connectors: Google Drive incremental sync (version checks), Notion markdown sync
-- Docling-first PDF extraction; optional image/chart captioning is file-based (no camera capture)
-- Grounded retrieval with source references
-- Terminal CLI for `rag init`, `rag auth`, `rag sync`, `rag ask`, `rag doctor`, `rag trace`
+V2 upgrades the project from a terminal-only tool to a persistent local assistant with a daemon API and multi-client access.
 
-## Quick start
+### What’s new in V2
+
+- FastAPI daemon on `127.0.0.1:8741`
+- Workspace registry persisted at `~/.pka/workspaces.json`
+- Workspace-aware routing from `workspace_hint` or `active_file`
+- Shared request schema across CLI, Chrome, and VS Code clients
+- Local auth token (`~/.pka/daemon_token`) required via `X-RAG-Token`
+- Chrome extension client (`clients/chrome-extension/`)
+- VS Code extension client (`clients/vscode-extension/`)
+- Dedicated Drive workspace (`drive://default`) and connector abstraction
+
+## V2 architecture
+
+```text
+Chrome Extension      VSCode Extension      CLI
+			│                     │                │
+			└──────────────┬──────┴────────────────┘
+										 ▼
+					FastAPI Daemon (localhost:8741)
+										 │
+			 WorkspaceRegistry + RAG Core Pipeline
+										 │
+			per-workspace SQLite + vector stores
+```
+
+## Install
 
 ```bash
 uv venv .venv
 source .venv/bin/activate
-uv pip install -e .
+uv pip install -e .[daemon]
 ```
 
-Install workflow + connector stack (recommended):
+For full local + cloud stack:
 
 ```bash
 uv pip install -e .[full]
 ```
 
-Install only Google Drive support (optional minimal install):
+## V2 quick usage
 
-```bash
-uv pip install -e .[gdrive]
-```
-
-Initialize project-local config and env:
+1. Initialize project settings
 
 ```bash
 rag init
 ```
 
-Index your project/documents:
+2. Register and index a workspace
 
 ```bash
-rag index .
+rag init-workspace .
 ```
 
-Incremental update for local folders (new/changed files only):
+3. Start daemon
 
 ```bash
-rag build /path/to/folder
+rag daemon start
 ```
 
-Search the index:
+4. Check daemon and workspace state
 
 ```bash
-rag search "colbert reranking"
+rag daemon status
+rag workspace list
 ```
 
-Search with explicit mode override:
+5. Query via CLI (core path still supported)
 
 ```bash
-rag search "colbert reranking" --mode hybrid
+rag ask "How does retrieval routing work in V2?"
 ```
 
-Ask a grounded question:
+## New CLI commands in V2
 
 ```bash
-rag ask "What did I write about retrieval evaluation?"
+rag daemon start|stop|status
+rag init-workspace <path>
+rag workspace list|remove
+rag drive auth|sync|status
 ```
 
-Ask using lexical-only fallback:
+## Daemon API (V2)
 
-```bash
-rag ask "What did I write about retrieval evaluation?" --mode lexical
+- `GET /health`
+- `POST /query`
+- `POST /ingest`
+- `GET /workspaces`
+- `POST /workspaces`
+
+`POST /query` accepts:
+
+```json
+{
+	"query": "string",
+	"workspace_hint": "/absolute/path/or/drive://default",
+	"clipboard_context": "optional user-selected text",
+	"active_file": "/absolute/path/to/file",
+	"active_code_selection": "optional highlighted code"
+}
 ```
 
-## Multi-source setup (local + cloud)
+## Security (local daemon)
 
-You can connect multiple sources at the same time, each with a unique `--source-id`.
+- Token file: `~/.pka/daemon_token`
+- Clients must send: `X-RAG-Token: <token>`
 
-### Connect multiple local folders
+## Client locations
 
-```bash
-rag sources connect local --path ~/Documents --source-id docs
-rag sources connect local --path ~/Notes --source-id notes
-rag sources connect local --path ~/Research --source-id research
-```
+- Chrome extension: `clients/chrome-extension/`
+- VS Code extension: `clients/vscode-extension/`
 
-### Connect multiple Google Drive folders
+## Notes
 
-Authenticate once:
-
-```bash
-rag auth google-drive --client-secret-file client_secret.json
-```
-
-Then connect one or more Drive folders:
-
-```bash
-rag sources connect google_drive --folder-id <FOLDER_ID_1> --destination .pka/sources/google-drive/work --source-id gdrive-work
-rag sources connect google_drive --folder-id <FOLDER_ID_2> --destination .pka/sources/google-drive/personal --source-id gdrive-personal
-```
-
-### Connect Notion roots
-
-```bash
-rag auth notion --client-id <id>
-rag auth notion --client-id <id> --client-secret <secret> --code <oauth_code>
-rag sources connect notion --root-page-id <ROOT_PAGE_ID_1> --source-id notion-main
-rag sources connect notion --root-page-id <ROOT_PAGE_ID_2> --source-id notion-wiki
-```
-
-List all connected sources:
-
-```bash
-rag sources list
-```
-
-## Cloud auth and sync
-
-Authenticate connectors (tokens stored in system keyring):
-
-```bash
-rag auth google-drive --client-secret-file client_secret.json
-```
-
-For Notion, first print authorization URL, then exchange code:
-
-```bash
-rag auth notion --client-id <id>
-rag auth notion --client-id <id> --client-secret <secret> --code <oauth_code>
-```
-
-Run incremental cloud sync (new/changed cloud docs only):
-
-```bash
-rag sync
-```
-
-`rag sync` reads `.env` keys:
-
-- `GOOGLE_DRIVE_FOLDER_ID`
-- `GOOGLE_DRIVE_DEST` (default `.pka/sources/google-drive`)
-- `NOTION_ROOT_PAGE_ID`
-- `NOTION_DEST` (default `.pka/sources/notion`)
-
-Only changed cloud documents are pulled (Google Drive by `version`, Notion by `last_edited_time`). Synced files are indexed automatically.
-
-## Incremental indexing workflow (new files only)
-
-Use these commands day-to-day to index only new/changed content:
-
-```bash
-# 1) pull + index only changed cloud files
-rag sync
-
-# 2) index only changed/new local files in a folder
-rag build ~/Documents
-rag build ~/Notes
-```
-
-Behavior summary:
-
-- `rag sync` = incremental for all connected cloud sources.
-- `rag build <path>` = incremental for that local path.
-- Unchanged chunks are skipped automatically.
-
-If files were deleted/renamed and you want a strict clean corpus, rebuild from scratch (remove `.pka/`, run `rag init`, reconnect sources, then `rag sync` + `rag build` as needed).
-
-## LLM modes
-
-- `none` (default): extractive grounded answer from retrieved chunks
-- `ollama`: calls local Ollama (`OLLAMA_BASE_URL`, `OLLAMA_MODEL`)
-- `openai`: calls OpenAI Chat Completions (`OPENAI_API_KEY`, `OPENAI_MODEL`)
-
-Set provider in `.pka/config.toml`.
-
-## Retrieval modes
-
-- `lexical`: SQLite FTS5 only (fastest, zero ML deps)
-- `dense`: embeddings vector search only
-- `hybrid` (default): lexical + dense fusion
-
-Dense/hybrid requires optional dependency set:
-
-```bash
-uv pip install -e .[retrieval]
-```
-
-## Vector database status
-
-Current implementation uses SQLite as local storage:
-
-- FTS5 table for lexical retrieval
-- `chunk_embeddings` table storing dense vectors as blobs
-- Dense retrieval uses in-process cosine similarity scan
-
-This is local vector storage in SQLite, not an external dedicated vector database yet.
-
-Default retrieval config in `.pka/config.toml`:
-
-```toml
-[retrieval]
-mode = "hybrid"
-embedding_model = "sentence-transformers/all-MiniLM-L6-v2"
-enable_reranker = false
-reranker_model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-```
-
-## Index Generations & Shadow Builds
-
-Build shadow index generations to test new embedding models/chunking strategies without affecting active retrieval:
-
-```bash
-# Build a shadow index with OpenAI embeddings
-rag build-generation v2-openai --embedding-profile-id openai-large
-
-# List all generations
-rag list-generations
-
-# Activate when satisfied
-rag activate-generation v2-openai
-```
-
-## Query Normalization & Enhancements
-
-- **Query normalization**: Automatic typo fixing and grammatical error correction before retrieval
-- **Reranker**: Cross-encoder rescoring for precision improvement (always enabled by default)
-- **Multi-provider embeddings**: Local (sentence-transformers), OpenAI, or Jina embeddings
-- **Chunking backends**: Pluggable chunk creation (fixed-size, semantic, Docling-aware)
-
-## Architecture modules
-
-- `personal_knowledge_agent/schemas.py`: core data contracts
-- `personal_knowledge_agent/ingest.py`: file discovery + parsing + chunking (pluggable backends)
-- `personal_knowledge_agent/index_store.py`: SQLite storage + FTS5 + generation management
-- `personal_knowledge_agent/embeddings.py`: multi-provider embedding + reranker engines
-- `personal_knowledge_agent/retrieval.py`: lexical/dense/hybrid + context fusion + reranking
-- `personal_knowledge_agent/llm.py`: LLM provider abstraction + query normalization
-- `personal_knowledge_agent/cli.py`: terminal UX + generation commands
+- Existing RAG core modules remain intact (`retrieve_with_context`, `generate_answer`, `ingest_path`).
+- V2 wraps and exposes the core through a persistent daemon and client integrations.

@@ -1,115 +1,120 @@
-# Personal Knowledge Agent — Quickstart
+# Personal Knowledge Agent — Quickstart (Version 2)
 
-## 1) One-time setup
+## 1) Install and initialize
 
 ```bash
 uv venv .venv
 source .venv/bin/activate
-uv pip install -e .[full]
+uv pip install -e .[daemon]
 rag init
 rag doctor
 ```
 
----
-
-## 2) Connect multiple local folders
-
-Use unique `--source-id` values for each local folder.
+For full connector support:
 
 ```bash
-rag sources connect local --path ~/Documents --source-id docs
-rag sources connect local --path ~/Notes --source-id notes
-rag sources connect local --path ~/Research --source-id research
-rag sources list
-```
-
-First indexing run:
-
-```bash
-rag build ~/Documents
-rag build ~/Notes
-rag build ~/Research
+uv pip install -e .[full]
 ```
 
 ---
 
-## 3) Connect multiple cloud sources
-
-### Google Drive (multiple folders)
-
-Authenticate once:
+## 2) Register and index your workspace
 
 ```bash
-rag auth google-drive --client-secret-file client_secret.json
+rag init-workspace .
+rag workspace list
 ```
 
-Connect one or more Drive folders:
+This creates/updates registry state in `~/.pka/workspaces.json` and indexes into `.pka/index.sqlite3`.
+
+---
+
+## 3) Start the V2 daemon
 
 ```bash
-rag sources connect google_drive --folder-id <FOLDER_ID_1> --destination .pka/sources/google-drive/work --source-id gdrive-work
-rag sources connect google_drive --folder-id <FOLDER_ID_2> --destination .pka/sources/google-drive/personal --source-id gdrive-personal
+rag daemon start
 ```
 
-### Notion (multiple roots)
+In another terminal:
 
 ```bash
-rag auth notion --client-id <id>
-rag auth notion --client-id <id> --client-secret <secret> --code <oauth_code>
-rag sources connect notion --root-page-id <ROOT_PAGE_ID_1> --source-id notion-main
-rag sources connect notion --root-page-id <ROOT_PAGE_ID_2> --source-id notion-wiki
-```
-
-Sync all connected cloud sources:
-
-```bash
-rag sync
-rag sources list
+rag daemon status
+curl -s http://127.0.0.1:8741/health
 ```
 
 ---
 
-## 4) Incremental updates (new files only)
-
-Day-to-day update commands:
+## 4) Read daemon token for clients
 
 ```bash
-# Cloud: pulls + indexes only new/changed cloud docs
-rag sync
-
-# Local: indexes only new/changed local files for each path
-rag build ~/Documents
-rag build ~/Notes
-rag build ~/Research
+cat ~/.pka/daemon_token
 ```
 
-Behavior summary:
-- `rag sync` is incremental for all connected cloud sources.
-- `rag build <path>` is incremental for that local path.
-- Unchanged chunks are skipped automatically.
+Chrome and VS Code clients must send this token as `X-RAG-Token`.
 
 ---
 
-## 5) Query and verify
+## 5) Query with workspace context
+
+### CLI path
 
 ```bash
-rag search "neural networks"
-rag ask "summarize key ideas from my ML notes"
-rag status
+rag ask "How does auth middleware work?"
+```
+
+### Daemon API path
+
+```bash
+TOKEN=$(cat ~/.pka/daemon_token)
+curl -s -X POST http://127.0.0.1:8741/query \
+	-H "Content-Type: application/json" \
+	-H "X-RAG-Token: $TOKEN" \
+	-d '{
+		"query": "How does auth middleware work?",
+		"workspace_hint": "'"$(pwd)"'"
+	}'
 ```
 
 ---
 
-## 6) If you deleted/renamed many files and want strict cleanup
+## 6) Google Drive in V2
 
-Incremental mode handles new/changed content well. For major deletions/renames, do a full reset:
+Authenticate:
 
 ```bash
-rm -rf .pka
-rag init
-rag sources list
-rag sync
-rag build ~/Documents
-rag build ~/Notes
+rag drive auth --client-secret-file client_secret.json
 ```
 
-Reconnect any sources if needed, then re-run `rag sync` and `rag build`.
+Sync and index Drive workspace:
+
+```bash
+rag drive sync
+rag drive status
+```
+
+Drive is handled as `drive://default` and stored separately from local repo workspaces.
+
+---
+
+## 7) Client setup pointers
+
+- Chrome extension files: `clients/chrome-extension/`
+- VS Code extension files: `clients/vscode-extension/`
+
+Both use daemon `http://localhost:8741` and V2 request context fields:
+
+- `workspace_hint`
+- `active_file`
+- `active_code_selection`
+- `clipboard_context`
+
+---
+
+## 8) Useful V2 commands
+
+```bash
+rag daemon start|stop|status
+rag init-workspace <path>
+rag workspace list|remove
+rag drive auth|sync|status
+```
