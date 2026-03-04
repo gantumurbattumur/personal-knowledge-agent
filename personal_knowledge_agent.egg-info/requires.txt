@@ -8,11 +8,18 @@ tomli>=2.0.1
 [auth]
 keyring>=25.0.0
 
+[chunking]
+semantic-text-splitter>=0.8.0
+
 [connectors]
 google-auth-oauthlib>=1.2.0
 google-api-python-client>=2.149.0
 google-auth>=2.35.0
 keyring>=25.0.0
+
+[embeddings]
+sentence-transformers>=3.0.0
+numpy>=1.26.0
 
 [epub]
 ebooklib>=0.18
@@ -32,6 +39,8 @@ google-auth-oauthlib>=1.2.0
 google-api-python-client>=2.149.0
 google-auth>=2.35.0
 keyring>=25.0.0
+semantic-text-splitter>=0.8.0
+pyspellchecker>=0.8.0
 
 [gdrive]
 gdown>=5.2.0
@@ -42,6 +51,9 @@ pypdf>=4.2.0
 
 [pdf]
 pypdf>=4.2.0
+
+[query]
+pyspellchecker>=0.8.0
 
 [retrieval]
 sentence-transformers>=3.0.0

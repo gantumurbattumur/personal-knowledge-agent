@@ -9,3 +9,4 @@ __pycache__/
 .pka/logs/
 .pka/vectorstore/
 .pka/index.sqlite3
+client_secret.json

@@ -140,7 +140,10 @@ def parse_pdf(path: Path, assets_dir: Path | None = None) -> ParsedDocumentResul
             )
             pages.append(f"## Page {page_index}\n{page_text}")
 
-        extracted_images = list(getattr(page, "images", []) or [])
+        try:
+            extracted_images = list(getattr(page, "images", []) or [])
+        except Exception:
+            extracted_images = []
         for image_index, image in enumerate(extracted_images, start=1):
             image_bytes = getattr(image, "data", None)
             if not image_bytes:

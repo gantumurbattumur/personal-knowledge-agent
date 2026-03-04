@@ -18,9 +18,15 @@ from .drive import sync_google_drive_incremental
 from .embeddings import EmbeddingEngine, RerankerEngine
 from .index_store import IndexStore
 from .ingest import ingest_path
-from .llm import generate_answer
+from .llm import generate_answer, optimize_query_for_retrieval
 from .notion import sync_notion_incremental
-from .retrieval import build_extractive_answer, compress_results_context, format_references, retrieve_with_context
+from .retrieval import (
+    build_concise_grounded_answer,
+    build_extractive_answer,
+    compress_results_context,
+    format_references,
+    retrieve_with_context,
+)
 from .vector_store import LanceVectorStore
 
 app = typer.Typer(help="Workflow-aware personal RAG assistant")
@@ -50,11 +56,28 @@ def _rewrite_query(question: str, cwd: Path) -> str:
     return "\n".join(parts)
 
 
+def _source_id_for(source_type: str, config: dict) -> str:
+    if source_type == "google_drive":
+        return str(config.get("folder_id") or "default").strip() or "default"
+    if source_type == "local":
+        return str(config.get("path") or "default").strip() or "default"
+    if source_type == "notion":
+        return str(config.get("root_page_id") or "default").strip() or "default"
+    return "default"
+
+
 def _token_status(service: str) -> str:
     try:
         return "ok" if load_token(service) else "missing"
     except Exception:
         return "disabled (keyring missing)"
+
+
+def _normalized_score(item_score: float, max_score: float) -> float:
+    if max_score <= 0:
+        return 0.0
+    ratio = max(0.0, min(1.0, item_score / max_score))
+    return ratio * 100.0
 
 
 def _llm_key_status(provider: str) -> str:
@@ -99,7 +122,7 @@ def _connected_services(store: IndexStore) -> dict[str, dict]:
         account_label = row["account_label"]
         config_raw = row["config_json"]
         details = mapping.setdefault(source_type, {"connected": False, "account_label": "-", "paths": []})
-        details["connected"] = enabled
+        details["connected"] = details["connected"] or enabled
         if account_label:
             details["account_label"] = account_label
         if config_raw:
@@ -111,6 +134,10 @@ def _connected_services(store: IndexStore) -> dict[str, dict]:
             if isinstance(path_value, str) and path_value:
                 details["paths"].append(path_value)
     return mapping
+
+
+def _is_external_source_path(source_path: str) -> bool:
+    return "/.pka/sources/" in str(source_path).replace("\\", "/")
 
 
 @app.command()
@@ -177,6 +204,7 @@ def config(
     table.add_row("embedding_model", settings.embedding_model)
     table.add_row("enable_reranker", str(settings.enable_reranker))
     table.add_row("reranker_model", settings.reranker_model)
+    table.add_row("prefer_external_sources", str(settings.prefer_external_sources))
     console.print(table)
 
 
@@ -273,6 +301,109 @@ def auth(
     raise typer.BadParameter("Unsupported service. Use: google-drive | notion")
 
 
+@app.command("build-generation")
+def build_generation_cmd(
+    generation_id: str = typer.Argument(..., help="Generation ID (e.g., v2-openai)"),
+    embedding_profile_id: str = typer.Option("v1-minilm", help="Embedding profile to use"),
+    chunking_profile_id: str = typer.Option("v1-fixed", help="Chunking profile to use"),
+    paths: str = typer.Option(".", help="Comma-separated paths to index"),
+) -> None:
+    """Build a shadow index generation without affecting active retrieval."""
+    from .ingest import ingest_path
+    from .embeddings import EmbeddingEngine
+    
+    settings = load_settings()
+    
+    with console.status(f"[bold]Building generation {generation_id}...[/]"):
+        with _store() as store:
+            # Register generation
+            store.get_or_create_generation(generation_id, embedding_profile_id, chunking_profile_id)
+            
+            # Ingest paths
+            for path_str in paths.split(","):
+                path = Path(path_str.strip()).resolve()
+                if not path.exists():
+                    console.print(f"[red]Path not found: {path}[/]")
+                    continue
+                
+                console.print(f"[cyan]Ingesting: {path}[/]")
+                bundle = ingest_path(path, chunking_strategy=chunking_profile_id.split("-")[1] if "-" in chunking_profile_id else "fixed")
+                
+                # Upsert chunks with generation tag
+                for chunk in bundle.chunks:
+                    chunk.index_generation = generation_id
+                    chunk.embedding_profile_id = embedding_profile_id
+                    chunk.chunking_profile_id = chunking_profile_id
+                
+                store.upsert_chunks(bundle.chunks)
+                store.upsert_assets(bundle.assets)
+                console.print(f"[green]✓ Indexed {len(bundle.chunks)} chunks[/]")
+            
+            # Embed with specified provider
+            embedding_provider = settings.embedding_provider
+            embedding_model = settings.embedding_model
+            
+            engine = EmbeddingEngine(embedding_model, provider=embedding_provider)
+            if not engine.status.enabled:
+                console.print(f"[red]Embedding engine disabled: {engine.status.reason}[/]")
+                return
+            
+            missing = store.chunks_missing_embeddings(embedding_model, index_generation=generation_id)
+            if missing:
+                console.print(f"[cyan]Embedding {len(missing)} chunks ({len(missing) // 50} batches)...[/]")
+                for i in range(0, len(missing), 50):
+                    batch = missing[i:i+50]
+                    texts = [chunk.text for chunk in batch]
+                    vectors = engine.encode(texts)
+                    if vectors:
+                        store.upsert_embeddings(embedding_model, batch, vectors)
+                console.print(f"[green]✓ {len(missing)} chunks embedded[/]")
+    
+    console.print(f"[green]Generation {generation_id} build complete[/]")
+
+
+@app.command("activate-generation")
+def activate_generation_cmd(
+    generation_id: str = typer.Argument(..., help="Generation ID to activate"),
+) -> None:
+    """Activate a built generation for retrieval."""
+    with _store() as store:
+        store.set_active_generation(generation_id)
+    console.print(f"[green]✓ Activated generation: {generation_id}[/]")
+
+
+@app.command("list-generations")
+def list_generations_cmd() -> None:
+    """List all index generations."""
+    with _store() as store:
+        gens = store.list_generations()
+    
+    if not gens:
+        console.print("[yellow]No generations found[/]")
+        return
+    
+    table = Table(title="Index Generations")
+    table.add_column("Generation ID")
+    table.add_column("Embedding Profile")
+    table.add_column("Chunking Profile")
+    table.add_column("Chunks")
+    table.add_column("Sources")
+    table.add_column("Status")
+    
+    for gen in gens:
+        status = "[bold green]ACTIVE[/]" if gen["is_active"] else "available"
+        table.add_row(
+            gen["generation_id"],
+            gen["embedding_profile_id"],
+            gen["chunking_profile_id"],
+            str(gen["chunk_count"] or 0),
+            str(gen["source_count"] or 0),
+            status,
+        )
+    
+    console.print(table)
+
+
 @app.command()
 def sync() -> None:
     settings = load_settings()
@@ -282,11 +413,13 @@ def sync() -> None:
     notion_root_page_id = os.getenv("NOTION_ROOT_PAGE_ID", "").strip()
     notion_destination = Path(os.getenv("NOTION_DEST", str(settings.app_dir / "sources/notion")))
 
+    drive_targets: list[tuple[str, Path, str]] = []
+    notion_targets: list[tuple[str, Path]] = []
     with _store() as store:
         for connection in store.list_source_connections():
-            source_type = str(connection["source_type"])
             if not bool(connection["enabled"]):
                 continue
+            source_type = str(connection["source_type"])
             config_raw = connection["config_json"]
             if not config_raw:
                 continue
@@ -296,61 +429,76 @@ def sync() -> None:
                 config_data = {}
 
             if source_type == "google_drive":
-                folder_id = str(config_data.get("folder_id") or folder_id).strip()
-                destination = Path(str(config_data.get("destination") or destination))
-                account_label = str(config_data.get("account_label") or account_label).strip()
-            if source_type == "notion":
-                notion_root_page_id = str(config_data.get("root_page_id") or notion_root_page_id).strip()
-                notion_destination = Path(str(config_data.get("destination") or notion_destination))
+                target_folder = str(config_data.get("folder_id") or "").strip()
+                target_destination = Path(str(config_data.get("destination") or destination))
+                target_account = str(config_data.get("account_label") or account_label).strip()
+                if target_folder:
+                    drive_targets.append((target_folder, target_destination, target_account))
+            elif source_type == "notion":
+                target_root = str(config_data.get("root_page_id") or "").strip()
+                target_destination = Path(str(config_data.get("destination") or notion_destination))
+                if target_root:
+                    notion_targets.append((target_root, target_destination))
 
-    drive_summary = "skipped"
-    notion_summary = "skipped"
+    if not drive_targets and folder_id:
+        drive_targets.append((folder_id, destination, account_label))
+    if not notion_targets and notion_root_page_id:
+        notion_targets.append((notion_root_page_id, notion_destination))
+
+    drive_status_lines: list[str] = []
+    notion_status_lines: list[str] = []
     sync_paths: list[Path] = []
-    if folder_id:
+    if drive_targets:
         token_payload = load_token("google-drive")
         if not token_payload:
             raise typer.BadParameter("Google Drive is not authenticated. Run: rag auth google-drive")
-        with _store() as store:
-            store.upsert_source_connection(
-                source_type="google_drive",
-                enabled=True,
-                account_label=account_label or None,
-                config_json=json.dumps({"folder_id": folder_id, "destination": str(destination), "account_label": account_label}),
-            )
-            result = sync_google_drive_incremental(
-                folder_id=folder_id,
-                destination=destination,
-                token_payload=token_payload,
-                store=store,
-            )
-        if not result.ok:
-            raise typer.BadParameter(result.message)
-        drive_summary = f"downloaded={result.downloaded}, unchanged={result.unchanged}, destination={result.destination}"
-        if result.downloaded > 0:
-            sync_paths.append(result.destination)
+        for target_folder, target_destination, target_account in drive_targets:
+            sid = _source_id_for("google_drive", {"folder_id": target_folder})
+            with _store() as store:
+                store.upsert_source_connection(
+                    source_type="google_drive",
+                    source_id=sid,
+                    enabled=True,
+                    account_label=target_account or None,
+                    config_json=json.dumps({"folder_id": target_folder, "destination": str(target_destination), "account_label": target_account}),
+                )
+                result = sync_google_drive_incremental(
+                    folder_id=target_folder,
+                    destination=target_destination,
+                    token_payload=token_payload,
+                    store=store,
+                )
+            if not result.ok:
+                raise typer.BadParameter(result.message)
+            drive_status_lines.append(f"id={sid} downloaded={result.downloaded}, unchanged={result.unchanged}, destination={result.destination}")
+            if result.downloaded > 0 or result.unchanged > 0:
+                sync_paths.append(result.destination)
 
-    if notion_root_page_id:
+    if notion_targets:
         token_payload = load_token("notion")
         if not token_payload:
             raise typer.BadParameter("Notion is not authenticated. Run: rag auth notion")
-        with _store() as store:
-            store.upsert_source_connection(
-                source_type="notion",
-                enabled=True,
-                account_label="notion",
-                config_json=json.dumps({"root_page_id": notion_root_page_id, "destination": str(notion_destination)}),
-            )
-            result = sync_notion_incremental(
-                root_page_id=notion_root_page_id,
-                destination=notion_destination,
-                token_payload=token_payload,
-                store=store,
-            )
-        if not result.ok:
-            raise typer.BadParameter(result.message)
-        notion_summary = f"downloaded={result.downloaded}, unchanged={result.unchanged}, destination={result.destination}"
-        if result.downloaded > 0:
-            sync_paths.append(result.destination)
+        for target_root, target_destination in notion_targets:
+            sid = _source_id_for("notion", {"root_page_id": target_root})
+            with _store() as store:
+                store.upsert_source_connection(
+                    source_type="notion",
+                    source_id=sid,
+                    enabled=True,
+                    account_label="notion",
+                    config_json=json.dumps({"root_page_id": target_root, "destination": str(target_destination)}),
+                )
+                result = sync_notion_incremental(
+                    root_page_id=target_root,
+                    destination=target_destination,
+                    token_payload=token_payload,
+                    store=store,
+                )
+            if not result.ok:
+                raise typer.BadParameter(result.message)
+            notion_status_lines.append(f"id={sid} downloaded={result.downloaded}, unchanged={result.unchanged}, destination={result.destination}")
+            if result.downloaded > 0 or result.unchanged > 0:
+                sync_paths.append(result.destination)
 
     for sync_path in sync_paths:
         rag_build(path=str(sync_path))
@@ -358,28 +506,39 @@ def sync() -> None:
     table = Table(title="RAG Sync")
     table.add_column("Connector")
     table.add_column("Status")
-    table.add_row("google-drive", drive_summary)
-    table.add_row("notion", notion_summary)
+    table.add_row("google-drive", "\n".join(drive_status_lines) if drive_status_lines else "skipped")
+    table.add_row("notion", "\n".join(notion_status_lines) if notion_status_lines else "skipped")
     console.print(table)
 
 
 @sources_app.command("list")
 def sources_list() -> None:
     with _store() as store:
-        services = _connected_services(store)
+        rows = store.list_source_connections()
 
     table = Table(title="Connected Services")
     table.add_column("Service")
+    table.add_column("Source ID")
     table.add_column("Connected")
     table.add_column("Account")
-    table.add_column("Paths")
-    for service in ["local", "google_drive", "notion", "dropbox"]:
-        entry = services.get(service, {"connected": False, "account_label": "-", "paths": []})
+    table.add_column("Path/Destination")
+    if not rows:
+        table.add_row("-", "-", "no", "-", "-")
+    for row in rows:
+        config_raw = row["config_json"]
+        config = {}
+        if config_raw:
+            try:
+                config = json.loads(str(config_raw))
+            except Exception:
+                config = {}
+        path_value = config.get("path") or config.get("destination") or "-"
         table.add_row(
-            service,
-            "yes" if entry["connected"] else "no",
-            str(entry.get("account_label") or "-"),
-            ", ".join(entry.get("paths", [])) or "-",
+            str(row["source_type"]),
+            str(row["source_id"]),
+            "yes" if bool(row["enabled"]) else "no",
+            str(row["account_label"] or "-"),
+            str(path_value),
         )
     console.print(table)
 
@@ -392,18 +551,21 @@ def sources_connect(
     destination: str = typer.Option("", help="Google Drive destination path"),
     account_label: str = typer.Option("", help="Connector account label"),
     root_page_id: str = typer.Option("", help="Notion root page id"),
+    source_id: str = typer.Option("", help="Unique source id (optional; defaults from connector config)"),
 ) -> None:
     normalized = source_type.strip().lower()
     with _store() as store:
         if normalized == "local":
             resolved = str(Path(path).expanduser().resolve())
+            sid = source_id.strip() or resolved
             store.upsert_source_connection(
                 source_type="local",
+                source_id=sid,
                 enabled=True,
                 account_label="local",
                 config_json=json.dumps({"path": resolved}),
             )
-            console.print(f"Connected local source: {resolved}")
+            console.print(f"Connected local source: {resolved} (id={sid})")
             return
 
         if normalized == "google_drive":
@@ -411,19 +573,20 @@ def sources_connect(
             drive_dest = destination or os.getenv("GOOGLE_DRIVE_DEST", str(load_settings().app_dir / "sources/google-drive"))
             if not drive_folder:
                 raise typer.BadParameter("Missing folder id. Use --folder-id or set GOOGLE_DRIVE_FOLDER_ID in .env")
+            config_payload = {
+                "folder_id": drive_folder,
+                "destination": str(Path(drive_dest).expanduser().resolve()),
+                "account_label": account_label or os.getenv("GOOGLE_DRIVE_ACCOUNT_LABEL", ""),
+            }
+            sid = source_id.strip() or _source_id_for("google_drive", config_payload)
             store.upsert_source_connection(
                 source_type="google_drive",
+                source_id=sid,
                 enabled=True,
                 account_label=account_label or os.getenv("GOOGLE_DRIVE_ACCOUNT_LABEL", "") or None,
-                config_json=json.dumps(
-                    {
-                        "folder_id": drive_folder,
-                        "destination": str(Path(drive_dest).expanduser().resolve()),
-                        "account_label": account_label or os.getenv("GOOGLE_DRIVE_ACCOUNT_LABEL", ""),
-                    }
-                ),
+                config_json=json.dumps(config_payload),
             )
-            console.print("Connected source: google_drive")
+            console.print(f"Connected source: google_drive (id={sid})")
             return
 
         if normalized == "notion":
@@ -431,23 +594,32 @@ def sources_connect(
             notion_dest = os.getenv("NOTION_DEST", str(load_settings().app_dir / "sources/notion"))
             if not notion_root:
                 raise typer.BadParameter("Missing root page id. Use --root-page-id or set NOTION_ROOT_PAGE_ID in .env")
+            config_payload = {"root_page_id": notion_root, "destination": str(Path(notion_dest).expanduser().resolve())}
+            sid = source_id.strip() or _source_id_for("notion", config_payload)
             store.upsert_source_connection(
                 source_type="notion",
+                source_id=sid,
                 enabled=True,
                 account_label=account_label or "notion",
-                config_json=json.dumps({"root_page_id": notion_root, "destination": str(Path(notion_dest).expanduser().resolve())}),
+                config_json=json.dumps(config_payload),
             )
-            console.print("Connected source: notion")
+            console.print(f"Connected source: notion (id={sid})")
             return
 
     raise typer.BadParameter("Unsupported source type. Use: local | google_drive | notion")
 
 
 @sources_app.command("disconnect")
-def sources_disconnect(source_type: str = typer.Argument(..., help="Source to disable")) -> None:
+def sources_disconnect(
+    source_type: str = typer.Argument(..., help="Source to disable"),
+    source_id: str = typer.Option("", help="Optional source id; omit to disable all for connector"),
+) -> None:
     with _store() as store:
-        store.disable_source_connection(source_type.strip().lower())
-    console.print(f"Disconnected source: {source_type}")
+        store.disable_source_connection(source_type.strip().lower(), source_id.strip() or None)
+    if source_id.strip():
+        console.print(f"Disconnected source: {source_type} (id={source_id.strip()})")
+    else:
+        console.print(f"Disconnected source: {source_type} (all ids)")
 
 
 @rag_app.command("status")
@@ -490,9 +662,15 @@ def search(
     top_k: int = typer.Option(8, min=1, max=30),
     mode: str | None = typer.Option(None, help="Override retrieval mode: lexical | dense | hybrid"),
 ) -> None:
+    from .llm import normalize_query
+    
     settings = load_settings()
     if mode:
         settings.retrieval_mode = mode.lower().strip()
+
+    # Apply query normalization if enabled
+    if settings.enable_query_normalization:
+        query = normalize_query(query)
 
     context_root = Path(".").resolve()
     with _store() as store:
@@ -504,7 +682,8 @@ def search(
         return
 
     table = Table(title=f"Search Results ({len(results)}) mode={used_mode}")
-    table.add_column("Score", justify="right")
+    max_score = max((item.score for item in results), default=0.0)
+    table.add_column("Confidence", justify="right")
     table.add_column("Lex", justify="right")
     table.add_column("Dense", justify="right")
     table.add_column("Source")
@@ -515,7 +694,7 @@ def search(
         if len(snippet) > 120:
             snippet = snippet[:120].rstrip() + "…"
         table.add_row(
-            f"{item.score:.3f}",
+            f"{_normalized_score(item.score, max_score):.1f}%",
             f"{item.lexical_score:.3f}",
             f"{item.dense_score:.3f}",
             item.source_path,
@@ -535,6 +714,8 @@ def ask(
     verbose: bool = typer.Option(False, "--verbose", help="Detailed grounded output"),
     refs: bool = typer.Option(False, "--refs", help="References-only mode"),
     show_rewrite: bool = typer.Option(False, help="Show rewritten query"),
+    rewrite: bool = typer.Option(False, help="Enable workflow query rewriting"),
+    preprocess_query: bool = typer.Option(True, help="Preprocess query before retrieval for better recall/precision"),
 ) -> None:
     settings = load_settings()
     if mode:
@@ -543,13 +724,22 @@ def ask(
     context_root = Path(cwd).expanduser().resolve()
 
     rewritten_query = _rewrite_query(question, context_root)
+    base_query = rewritten_query if rewrite else question.strip()
+    optimized_query = optimize_query_for_retrieval(settings, question=base_query, context_hint="workflow-aware rag retrieval") if preprocess_query else base_query
+    retrieval_query = optimized_query or base_query
 
     with _store() as store:
         vector_store = _vector_store()
-        workflow_context, results, used_mode = retrieve_with_context(store, vector_store, rewritten_query, context_root, top_k, settings)
+        workflow_context, results, used_mode = retrieve_with_context(store, vector_store, retrieval_query, context_root, top_k, settings)
+        external_results = [item for item in results if _is_external_source_path(item.source_path)]
+        if settings.prefer_external_sources and len(external_results) >= min(4, top_k):
+            results = external_results[:top_k]
         compressed_context, used_chunks = compress_results_context(results)
         evidence = build_extractive_answer(question, results)
-        response = generate_answer(settings, question, evidence if not compressed_context else compressed_context)
+        if settings.llm_provider == "none":
+            response = build_concise_grounded_answer(question, results)
+        else:
+            response = generate_answer(settings, question, evidence if not compressed_context else compressed_context)
 
         store.write_trace(
             query=question,
@@ -573,11 +763,14 @@ def ask(
         return
 
     if debug:
+        max_score = max((item.score for item in results), default=0.0)
         steps = Table(title="Retrieval Steps")
         steps.add_column("Step")
         steps.add_column("Details")
         steps.add_row("query", question)
-        steps.add_row("rewritten", rewritten_query)
+        steps.add_row("rewritten", rewritten_query if rewrite else "(disabled)")
+        steps.add_row("query_optimized", retrieval_query)
+        steps.add_row("retrieval_query", retrieval_query)
         steps.add_row("mode", used_mode)
         steps.add_row("pipeline", "hybrid search -> rerank -> context compression")
         steps.add_row("used_chunks", ", ".join(used_chunks) if used_chunks else "none")
@@ -585,7 +778,8 @@ def ask(
 
         topk = Table(title=f"Top-K Retrieved ({len(results)})")
         topk.add_column("Rank", justify="right")
-        topk.add_column("Score", justify="right")
+        topk.add_column("Confidence", justify="right")
+        topk.add_column("Raw", justify="right")
         topk.add_column("Why")
         topk.add_column("Source")
         topk.add_column("Location")
@@ -597,6 +791,7 @@ def ask(
                 location.append(item.section_heading or item.section)
             topk.add_row(
                 str(idx),
+                f"{_normalized_score(item.score, max_score):.1f}%",
                 f"{item.score:.3f}",
                 item.selected_reason or "score",
                 item.source_path,
@@ -604,8 +799,7 @@ def ask(
             )
         console.print(topk)
 
-    console.rule("Answer")
-    console.print(response)
+    console.print(Panel(response, title="Grounded Answer", border_style="cyan"))
 
     console.rule("References")
     if refs_output:
@@ -618,6 +812,7 @@ def ask(
         console.rule("Workflow Context")
         if show_rewrite:
             console.print(f"rewritten_query: {rewritten_query}")
+        console.print(f"optimized_query: {retrieval_query}")
         console.print(f"retrieval_mode: {used_mode}")
         console.print(f"cwd: {workflow_context.cwd}")
         console.print(f"git_branch: {workflow_context.git_branch or 'N/A'}")
@@ -663,9 +858,11 @@ def doctor() -> None:
     status_table.add_row("project_app_dir", str(settings.app_dir))
     status_table.add_row("database", str(settings.db_path))
     status_table.add_row("vector_index", str(settings.vectorstore_path))
-    status_table.add_row("llm_provider", f"{settings.llm_provider} ({_llm_key_status(settings.llm_provider)})")
+    status_table.add_row("llm_provider", f"{settings.llm_provider} (ok)" if settings.llm_provider != "none" else "none (n/a)")
     status_table.add_row("retrieval_mode", settings.retrieval_mode)
     status_table.add_row("embedding_model", settings.embedding_model)
+    status_table.add_row("embedding_provider", settings.embedding_provider)
+    status_table.add_row("embedding_profile_id", settings.embedding_profile_id)
 
     embed_status = EmbeddingEngine(settings.embedding_model).status
     status_table.add_row("embedding_engine", "ok" if embed_status.enabled else f"disabled: {embed_status.reason}")
@@ -673,7 +870,12 @@ def doctor() -> None:
     status_table.add_row("lancedb_engine", "ok" if lancedb_status.enabled else f"disabled: {lancedb_status.reason}")
 
     reranker_status = RerankerEngine(settings.reranker_model, enabled=settings.enable_reranker).status
-    status_table.add_row("reranker", "ok" if reranker_status.enabled else f"disabled: {reranker_status.reason}")
+    status_table.add_row("reranker", "enabled" if reranker_status.enabled else f"disabled: {reranker_status.reason}")
+    status_table.add_row("reranker_model", settings.reranker_model)
+    status_table.add_row("chunking_strategy", settings.chunking_strategy)
+    status_table.add_row("chunking_profile_id", settings.chunking_profile_id)
+    status_table.add_row("query_normalization", "on" if settings.enable_query_normalization else "off")
+    status_table.add_row("active_index_generation", settings.active_index_generation)
     status_table.add_row("auth_google_drive", _token_status("google-drive"))
     status_table.add_row("auth_notion", _token_status("notion"))
 
@@ -687,6 +889,58 @@ def doctor() -> None:
         status_table.add_row("index", f"error: {exc}")
 
     console.print(status_table)
+
+
+@app.command("profile")
+def profile_command(
+    list_profiles: bool = typer.Option(False, "--list", help="List available profiles"),
+    show_active: bool = typer.Option(False, "--active", help="Show active profile"),
+) -> None:
+    """Manage index generation profiles and active configuration."""
+    settings = load_settings()
+    profiles_dir = settings.profiles_dir
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+
+    if list_profiles or not show_active:
+        # List all profiles
+        profile_files = sorted(profiles_dir.glob("*.toml"))
+        if not profile_files:
+            console.print("[yellow]No profiles found.[/yellow]")
+            return
+
+        table = Table(title="Available Profiles")
+        table.add_column("Profile ID")
+        table.add_column("Embedding Model")
+        table.add_column("Chunking Strategy")
+        table.add_column("Status")
+
+        for pf in profile_files:
+            profile_id = pf.stem
+            try:
+                content = pf.read_text()
+                is_active = profile_id == settings.active_index_generation
+                status = "active" if is_active else "available"
+                # Parse toml manually for embedding_model and chunking_strategy
+                embedding_model = "unknown"
+                chunking = "unknown"
+                for line in content.split("\n"):
+                    if "embedding_model" in line and "=" in line:
+                        embedding_model = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if "chunking_strategy" in line and "=" in line:
+                        chunking = line.split("=", 1)[1].strip().strip('"').strip("'")
+                table.add_row(profile_id, embedding_model, chunking, status)
+            except Exception:
+                table.add_row(profile_id, "error", "error", "error")
+
+        console.print(table)
+
+    if show_active:
+        console.print(f"[bold]Active profile:[/bold] {settings.active_index_generation}")
+        console.print(f"[bold]Embedding provider:[/bold] {settings.embedding_provider}")
+        console.print(f"[bold]Embedding model:[/bold] {settings.embedding_model}")
+        console.print(f"[bold]Chunking strategy:[/bold] {settings.chunking_strategy}")
+        console.print(f"[bold]Reranker enabled:[/bold] {settings.enable_reranker}")
+        console.print(f"[bold]Query normalization:[/bold] {settings.enable_query_normalization}")
 
 
 @app.command("info")

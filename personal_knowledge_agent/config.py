@@ -34,12 +34,24 @@ class Settings:
     anthropic_model: str = "claude-3-5-sonnet-latest"
     retrieval_mode: str = "hybrid"
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    enable_reranker: bool = False
+    embedding_provider: str = "local"  # local | openai | jina
+    embedding_profile_id: str = "v1-minilm"
+    enable_reranker: bool = True
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    prefer_external_sources: bool = True
+    chunking_strategy: str = "fixed"  # fixed | semantic | docling
+    chunking_profile_id: str = "v1-fixed"
+    query_rewrite_mode: str = "heuristic"  # heuristic | heuristic+llm | aggressive
+    active_index_generation: str = "v1"
+    enable_query_normalization: bool = True
 
     @property
     def lancedb_path(self) -> Path:
         return self.vectorstore_path
+    
+    @property
+    def profiles_dir(self) -> Path:
+        return self.app_dir / "profiles"
 
 
 def _run(command: list[str], cwd: Path) -> str | None:
@@ -92,6 +104,8 @@ def ensure_app_dir(start: Path | None = None) -> Path:
     (app_dir / "vectorstore").mkdir(parents=True, exist_ok=True)
     (app_dir / "cache").mkdir(parents=True, exist_ok=True)
     (app_dir / "logs").mkdir(parents=True, exist_ok=True)
+    (app_dir / "profiles").mkdir(parents=True, exist_ok=True)
+    (app_dir / "sources").mkdir(parents=True, exist_ok=True)
     return app_dir
 
 
@@ -111,7 +125,7 @@ cache_dir = ".pka/cache"
 logs_dir = ".pka/logs"
 
 [llm]
-provider = "none"  # none | local | openai | anthropic
+provider = "openai"  # none | local | openai | anthropic
 ollama_base_url = "http://localhost:11434"
 ollama_model = "llama3.1:8b-instruct-q4_K_M"
 openai_model = "gpt-4o-mini"
@@ -120,8 +134,25 @@ anthropic_model = "claude-3-5-sonnet-latest"
 [retrieval]
 mode = "hybrid"  # lexical | dense | hybrid
 embedding_model = "sentence-transformers/all-MiniLM-L6-v2"
-enable_reranker = false
-reranker_model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+embedding_provider = "local"  # local | openai | jina
+embedding_profile_id = "v1-minilm"
+enable_reranker = true
+reranker_model = "cross-encoder/ms-marco-MiniLM-L-12-v2"
+prefer_external_sources = true
+
+[chunking]
+strategy = "fixed"  # fixed | semantic | docling
+profile_id = "v1-fixed"
+chunk_size_hint = 900
+overlap_tokens = 100
+semantic_vocab_size = 1000
+
+[query]
+rewrite_mode = "heuristic"  # heuristic | heuristic+llm | aggressive
+enable_normalization = true
+
+[profiles]
+active_index_generation = "v1"
 """
     config_path.write_text(config_text, encoding="utf-8")
     return config_path
@@ -268,6 +299,79 @@ def load_settings(start: Path | None = None) -> Settings:
         default="sentence-transformers/all-MiniLM-L6-v2",
     )
 
+    embedding_provider = _resolve_str(
+        env_key="PKA_EMBEDDING_PROVIDER",
+        env_file=env_file,
+        config_value=retrieval.get("embedding_provider", "local"),
+        default="local",
+    ).lower().strip()
+
+    embedding_profile_id = _resolve_str(
+        env_key="PKA_EMBEDDING_PROFILE_ID",
+        env_file=env_file,
+        config_value=retrieval.get("embedding_profile_id", "v1-minilm"),
+        default="v1-minilm",
+    )
+
+    enable_reranker = _resolve_bool(
+        env_key="PKA_ENABLE_RERANKER",
+        env_file=env_file,
+        config_value=retrieval.get("enable_reranker", True),
+        default=True,
+    )
+
+    reranker_model = _resolve_str(
+        env_key="PKA_RERANKER_MODEL",
+        env_file=env_file,
+        config_value=retrieval.get("reranker_model", "cross-encoder/ms-marco-MiniLM-L-12-v2"),
+        default="cross-encoder/ms-marco-MiniLM-L-12-v2",
+    )
+
+    prefer_external_sources = _resolve_bool(
+        env_key="PKA_PREFER_EXTERNAL_SOURCES",
+        env_file=env_file,
+        config_value=retrieval.get("prefer_external_sources", True),
+        default=True,
+    )
+
+    chunking = raw.get("chunking", {})
+    chunking_strategy = _resolve_str(
+        env_key="PKA_CHUNKING_STRATEGY",
+        env_file=env_file,
+        config_value=chunking.get("strategy", "fixed"),
+        default="fixed",
+    ).lower().strip()
+
+    chunking_profile_id = _resolve_str(
+        env_key="PKA_CHUNKING_PROFILE_ID",
+        env_file=env_file,
+        config_value=chunking.get("profile_id", "v1-fixed"),
+        default="v1-fixed",
+    )
+
+    query = raw.get("query", {})
+    query_rewrite_mode = _resolve_str(
+        env_key="PKA_QUERY_REWRITE_MODE",
+        env_file=env_file,
+        config_value=query.get("rewrite_mode", "heuristic"),
+        default="heuristic",
+    ).lower().strip()
+
+    enable_query_normalization = _resolve_bool(
+        env_key="PKA_ENABLE_QUERY_NORMALIZATION",
+        env_file=env_file,
+        config_value=query.get("enable_normalization", True),
+        default=True,
+    )
+
+    profiles = raw.get("profiles", {})
+    active_index_generation = _resolve_str(
+        env_key="PKA_ACTIVE_INDEX_GENERATION",
+        env_file=env_file,
+        config_value=profiles.get("active_index_generation", "v1"),
+        default="v1",
+    )
+
     return Settings(
         project_root=project_root,
         app_dir=app_dir,
@@ -303,18 +407,16 @@ def load_settings(start: Path | None = None) -> Settings:
         ),
         retrieval_mode=retrieval_mode,
         embedding_model=embedding_model,
-        enable_reranker=_resolve_bool(
-            env_key="PKA_ENABLE_RERANKER",
-            env_file=env_file,
-            config_value=retrieval.get("enable_reranker", False),
-            default=False,
-        ),
-        reranker_model=_resolve_str(
-            env_key="PKA_RERANKER_MODEL",
-            env_file=env_file,
-            config_value=retrieval.get("reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2"),
-            default="cross-encoder/ms-marco-MiniLM-L-6-v2",
-        ),
+        embedding_provider=embedding_provider,
+        embedding_profile_id=embedding_profile_id,
+        enable_reranker=enable_reranker,
+        reranker_model=reranker_model,
+        prefer_external_sources=prefer_external_sources,
+        chunking_strategy=chunking_strategy,
+        chunking_profile_id=chunking_profile_id,
+        query_rewrite_mode=query_rewrite_mode,
+        enable_query_normalization=enable_query_normalization,
+        active_index_generation=active_index_generation,
     )
 
 

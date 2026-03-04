@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from .embeddings import EmbeddingEngine, RerankerEngine
@@ -71,6 +72,100 @@ def _stable_sort_key(item: RetrievalResult) -> tuple:
     )
 
 
+def _query_tokens(query: str) -> list[str]:
+    raw_tokens = re.findall(r"[a-zA-Z0-9]+", query.lower())
+    tokens = [token for token in raw_tokens if len(token) >= 3]
+    expanded = set(tokens)
+    if "genai" in expanded or ("generative" in expanded and "ai" in expanded):
+        expanded.update({"llm", "llms", "model", "models", "transformer", "foundation", "generative"})
+    return sorted(expanded)
+
+
+def _apply_query_alignment(query: str, results: list[RetrievalResult]) -> None:
+    tokens = _query_tokens(query)
+    if not tokens:
+        return
+
+    q_lower = query.lower()
+    genai_intent = any(keyword in q_lower for keyword in ["genai", "generative", "llm", "foundation model", "foundation-model"])
+    genai_markers = [" ai ", " llm", "generative", "foundation model", "transformer", "language model"]
+
+    for item in results:
+        title_text = (item.title or "").lower()
+        body_text = (item.text or "").lower()
+        overlap = 0
+        title_overlap = 0
+        for token in tokens:
+            in_title = token in title_text
+            in_body = token in body_text
+            if in_title or in_body:
+                overlap += 1
+                if in_title:
+                    title_overlap += 1
+
+        if overlap == 0:
+            item.score *= 0.78
+            continue
+
+        if genai_intent:
+            combined = f" {title_text} {body_text} "
+            if not any(marker in combined for marker in genai_markers):
+                item.score *= 0.62
+
+        body_boost = 1.0 + min(overlap, 6) * 0.06
+        title_boost = 1.0 + min(title_overlap, 3) * 0.05
+        item.score *= body_boost * title_boost
+        if title_overlap > 0:
+            item.selected_reason = "query_aligned"
+
+
+def _diversify_by_source(results: list[RetrievalResult], top_k: int, max_per_source: int = 2) -> list[RetrievalResult]:
+    if not results:
+        return []
+
+    buckets: dict[str, list[RetrievalResult]] = {}
+    source_order: list[str] = []
+    for item in results:
+        key = item.source_path
+        if key not in buckets:
+            buckets[key] = []
+            source_order.append(key)
+        buckets[key].append(item)
+
+    source_order.sort(key=lambda key: -buckets[key][0].score if buckets[key] else 0.0)
+
+    picked_per_source: dict[str, int] = {key: 0 for key in source_order}
+    chosen: list[RetrievalResult] = []
+
+    while len(chosen) < top_k:
+        progressed = False
+        for source_key in source_order:
+            if len(chosen) >= top_k:
+                break
+            if picked_per_source[source_key] >= max_per_source:
+                continue
+            bucket = buckets[source_key]
+            if not bucket:
+                continue
+            chosen.append(bucket.pop(0))
+            picked_per_source[source_key] += 1
+            progressed = True
+        if not progressed:
+            break
+
+    if len(chosen) < top_k:
+        leftovers: list[RetrievalResult] = []
+        for source_key in source_order:
+            leftovers.extend(buckets[source_key])
+        leftovers.sort(key=_stable_sort_key)
+        for item in leftovers:
+            chosen.append(item)
+            if len(chosen) >= top_k:
+                break
+
+    return chosen[:top_k]
+
+
 def _apply_context_boost(context: WorkflowContext, results: list[RetrievalResult]) -> None:
     cwd = Path(context.cwd).expanduser().resolve()
 
@@ -81,6 +176,8 @@ def _apply_context_boost(context: WorkflowContext, results: list[RetrievalResult
         try:
             source = Path(result.source_path).expanduser().resolve()
             in_cwd = source.is_relative_to(cwd)
+            if "/.pka/sources/" in source.as_posix():
+                in_cwd = False
         except Exception:
             in_cwd = False
 
@@ -91,6 +188,67 @@ def _apply_context_boost(context: WorkflowContext, results: list[RetrievalResult
             result.workflow_boost = 1.5
             result.score *= result.workflow_boost
             result.selected_reason = "workflow_boost"
+
+
+def _should_apply_workflow_boost(query: str) -> bool:
+    q = query.lower()
+    workflow_markers = (
+        "repo",
+        "repository",
+        "code",
+        "function",
+        "class",
+        "method",
+        "file",
+        "bug",
+        "error",
+        "traceback",
+        "cli",
+        "config",
+        "pyproject",
+        "readme",
+    )
+    return any(marker in q for marker in workflow_markers)
+
+
+def _apply_external_source_preference(settings: Settings, results: list[RetrievalResult]) -> None:
+    if not settings.prefer_external_sources:
+        return
+
+    project_root = settings.project_root.expanduser().resolve()
+    for result in results:
+        try:
+            source = Path(result.source_path).expanduser().resolve()
+        except Exception:
+            continue
+
+        source_posix = source.as_posix()
+        in_synced_sources = "/.pka/sources/" in source_posix
+        in_workspace = False
+        try:
+            in_workspace = source.is_relative_to(project_root)
+        except Exception:
+            in_workspace = False
+
+        if in_workspace and not in_synced_sources:
+            result.score *= 0.72
+            if not result.selected_reason:
+                result.selected_reason = "workspace_penalty"
+
+
+def _order_preferred_sources(settings: Settings, results: list[RetrievalResult]) -> list[RetrievalResult]:
+    if not settings.prefer_external_sources or not results:
+        return results
+
+    external: list[RetrievalResult] = []
+    fallback: list[RetrievalResult] = []
+    for result in results:
+        source = (result.source_path or "").replace("\\", "/")
+        if "/.pka/sources/" in source:
+            external.append(result)
+        else:
+            fallback.append(result)
+    return external + fallback
 
 
 def _maybe_rerank(
@@ -132,15 +290,17 @@ def retrieve_with_context(
 ) -> tuple[WorkflowContext, list[RetrievalResult], str]:
     context = collect_workflow_context(cwd)
     mode = settings.retrieval_mode
+    candidate_pool = max(top_k * 6, 36)
+    active_generation = settings.active_index_generation
 
     lexical_results: list[RetrievalResult] = []
     dense_results: list[RetrievalResult] = []
 
     if mode in {"lexical", "hybrid"}:
-        lexical_results = store.search(query, top_k=max(top_k * 3, 20))
+        lexical_results = store.search(query, top_k=max(top_k * 3, 20), index_generation=active_generation)
 
     if mode in {"dense", "hybrid"}:
-        engine = EmbeddingEngine(settings.embedding_model)
+        engine = EmbeddingEngine(settings.embedding_model, provider=settings.embedding_provider)
         query_vector = engine.encode_query(query) if engine.status.enabled else None
         if query_vector is not None:
             if vector_store and vector_store.enabled:
@@ -150,25 +310,35 @@ def retrieve_with_context(
                     top_k=max(top_k * 3, 20),
                 )
             else:
-                dense_results = store.dense_search(query_vector, embedding_model=settings.embedding_model, top_k=max(top_k * 3, 20))
+                dense_results = store.dense_search(query_vector, embedding_model=settings.embedding_model, top_k=max(top_k * 3, 20), index_generation=active_generation)
         elif mode == "dense":
-            lexical_results = store.search(query, top_k=max(top_k * 3, 20))
+            lexical_results = store.search(query, top_k=max(top_k * 3, 20), index_generation=active_generation)
             mode = "lexical"
 
     if mode == "lexical":
-        results = lexical_results[:top_k]
+        results = lexical_results[:candidate_pool]
         for item in results:
             item.selected_reason = "lexical"
     elif mode == "dense":
-        results = dense_results[:top_k]
+        results = dense_results[:candidate_pool]
         for item in results:
             item.selected_reason = "dense"
     else:
-        results = _fuse_results_rrf(lexical_results, dense_results, top_k=top_k)
+        results = _fuse_results_rrf(lexical_results, dense_results, top_k=candidate_pool)
 
-    _apply_context_boost(context, results)
+    if _should_apply_workflow_boost(query):
+        _apply_context_boost(context, results)
+    _apply_external_source_preference(settings, results)
+    _apply_query_alignment(query, results)
     results.sort(key=_stable_sort_key)
-    results = _maybe_rerank(query, results, settings, max_rerank=min(top_k, 12))
+    
+    # Rerank larger candidate pool before diversification (reranker always on when enabled)
+    rerank_pool = min(len(results), max(top_k * 3, 24))
+    results = _maybe_rerank(query, results, settings, max_rerank=rerank_pool)
+    results.sort(key=_stable_sort_key)
+    results = _order_preferred_sources(settings, results)
+    
+    results = _diversify_by_source(results, top_k=top_k, max_per_source=2)
     results.sort(key=_stable_sort_key)
     return context, results[:top_k], mode
 
@@ -187,11 +357,68 @@ def build_extractive_answer(query: str, results: list[RetrievalResult], max_snip
     return "\n".join(lines)
 
 
+def build_concise_grounded_answer(question: str, results: list[RetrievalResult], max_points: int = 4) -> str:
+    if not results:
+        return "Insufficient indexed evidence to answer this question."
+
+    lines = [f"Question: {question}", "", "Grounded summary:"]
+    seen = set()
+    points = 0
+
+    def best_sentence(text: str) -> str:
+        compact = " ".join(text.split())
+        if not compact:
+            return ""
+        candidates = re.split(r"(?<=[.!?])\s+", compact)
+        for candidate in candidates:
+            cleaned = candidate.strip()
+            if len(cleaned) < 60:
+                continue
+            digit_ratio = sum(ch.isdigit() for ch in cleaned) / max(len(cleaned), 1)
+            if digit_ratio > 0.25:
+                continue
+            if "www." in cleaned.lower():
+                continue
+            return cleaned
+        return compact[:220].rstrip() + ("…" if len(compact) > 220 else "")
+
+    for item in results:
+        snippet = best_sentence(item.text)
+        if not snippet:
+            continue
+        normalized = snippet[:180].lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+
+        if len(snippet) > 220:
+            snippet = snippet[:220].rstrip() + "…"
+
+        source_label = item.title or Path(item.source_path).name
+        location = f"p.{item.page_number}" if item.page_number is not None else (item.section_heading or item.section or "")
+        if location:
+            lines.append(f"- {snippet} ({source_label}, {location})")
+        else:
+            lines.append(f"- {snippet} ({source_label})")
+        points += 1
+        if points >= max_points:
+            break
+
+    if points == 0:
+        return "Insufficient indexed evidence to answer this question."
+    return "\n".join(lines)
+
+
 def compress_results_context(results: list[RetrievalResult], max_chars: int = 2600) -> tuple[str, list[str]]:
     consumed = 0
     snippets: list[str] = []
     used_chunks: list[str] = []
+    seen_sources: set[str] = set()
     for item in results:
+        source_key = f"{item.source_path}:{item.page_number}:{item.section}"
+        if source_key in seen_sources and len(snippets) >= 2:
+            continue
+        seen_sources.add(source_key)
         snippet = " ".join(item.text.split())
         if len(snippet) > 320:
             snippet = snippet[:320].rstrip() + "…"

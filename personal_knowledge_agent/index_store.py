@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 import sqlite3
 from array import array
 from pathlib import Path
@@ -36,7 +37,10 @@ class IndexStore:
                 image_description TEXT,
                 external_id TEXT,
                 version_id TEXT,
-                branch_hint TEXT
+                branch_hint TEXT,
+                index_generation TEXT NOT NULL DEFAULT 'v1',
+                chunking_profile_id TEXT,
+                embedding_profile_id TEXT
             );
 
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -71,6 +75,7 @@ class IndexStore:
 
             CREATE INDEX IF NOT EXISTS idx_chunks_source_path ON chunks(source_path);
             CREATE INDEX IF NOT EXISTS idx_chunks_fingerprint ON chunks(fingerprint);
+            CREATE INDEX IF NOT EXISTS idx_chunks_generation ON chunks(index_generation);
             CREATE INDEX IF NOT EXISTS idx_embeddings_model ON chunk_embeddings(embedding_model);
 
             CREATE TABLE IF NOT EXISTS sync_state (
@@ -106,11 +111,33 @@ class IndexStore:
             );
 
             CREATE TABLE IF NOT EXISTS source_connections (
-                source_type TEXT PRIMARY KEY,
+                source_type TEXT NOT NULL,
+                source_id TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 account_label TEXT,
                 config_json TEXT,
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY(source_type, source_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS index_generations (
+                generation_id TEXT PRIMARY KEY,
+                embedding_profile_id TEXT NOT NULL,
+                chunking_profile_id TEXT NOT NULL,
+                chunk_count INTEGER DEFAULT 0,
+                source_count INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                is_active INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS migrations_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+                from_generation TEXT,
+                to_generation TEXT,
+                migration_type TEXT,
+                details TEXT
             );
             """
         )
@@ -138,6 +165,12 @@ class IndexStore:
             self.conn.execute("ALTER TABLE chunks ADD COLUMN version_id TEXT")
         if "branch_hint" not in chunk_columns:
             self.conn.execute("ALTER TABLE chunks ADD COLUMN branch_hint TEXT")
+        if "index_generation" not in chunk_columns:
+            self.conn.execute("ALTER TABLE chunks ADD COLUMN index_generation TEXT NOT NULL DEFAULT 'v1'")
+        if "chunking_profile_id" not in chunk_columns:
+            self.conn.execute("ALTER TABLE chunks ADD COLUMN chunking_profile_id TEXT")
+        if "embedding_profile_id" not in chunk_columns:
+            self.conn.execute("ALTER TABLE chunks ADD COLUMN embedding_profile_id TEXT")
 
         trace_columns = {
             row["name"]
@@ -164,6 +197,32 @@ class IndexStore:
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_version_id ON chunks(version_id)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_assets_source_path ON assets(source_path)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_assets_type ON assets(asset_type)")
+
+        source_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(source_connections)").fetchall()
+        }
+        if "source_id" not in source_columns:
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS source_connections_v2 (
+                    source_type TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    account_label TEXT,
+                    config_json TEXT,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY(source_type, source_id)
+                );
+
+                INSERT OR IGNORE INTO source_connections_v2 (source_type, source_id, enabled, account_label, config_json, updated_at)
+                SELECT source_type, 'default', enabled, account_label, config_json, updated_at
+                FROM source_connections;
+
+                DROP TABLE source_connections;
+                ALTER TABLE source_connections_v2 RENAME TO source_connections;
+                """
+            )
 
     def __enter__(self) -> "IndexStore":
         return self
@@ -317,16 +376,23 @@ class IndexStore:
             return 0.0
         return dot / denom
 
-    def dense_search(self, query_vector: list[float], embedding_model: str, top_k: int = 8) -> list[RetrievalResult]:
+    def dense_search(self, query_vector: list[float], embedding_model: str, top_k: int = 8, index_generation: str | None = None) -> list[RetrievalResult]:
+        where_clause = "WHERE e.embedding_model = ?"
+        params: list = [embedding_model]
+        
+        if index_generation:
+            where_clause += " AND c.index_generation = ?"
+            params.append(index_generation)
+        
         rows = self.conn.execute(
-            """
+            f"""
             SELECT c.chunk_id, c.source_path, c.title, c.section, c.text, e.vector_blob, e.dims
                 , c.branch_hint, c.cloud_url, c.page_number
             FROM chunk_embeddings e
             JOIN chunks c ON c.chunk_id = e.chunk_id
-            WHERE e.embedding_model = ?
+            {where_clause}
             """,
-            (embedding_model,),
+            params,
         ).fetchall()
 
         scored: list[RetrievalResult] = []
@@ -355,16 +421,26 @@ class IndexStore:
         scored.sort(key=lambda item: item.score, reverse=True)
         return scored[:top_k]
 
-    def search(self, query: str, top_k: int = 8) -> list[RetrievalResult]:
+    def search(self, query: str, top_k: int = 8, index_generation: str | None = None) -> list[RetrievalResult]:
         query = query.strip()
         if not query:
             return []
 
-        safe_query = self._safe_fts_query(query)
+        tokens = self._fts_tokens(query)
+        if not tokens:
+            return []
+
+        strict_query = " ".join(f'"{token}"' for token in tokens[:8])
+        or_query = " OR ".join(f'"{token}"' for token in tokens[:16])
+        
+        gen_filter = ""
+        gen_param = ()
+        if index_generation:
+            gen_filter = " AND c.index_generation = ?"
+            gen_param = (index_generation,)
 
         def run_fts(fts_query: str) -> list[sqlite3.Row]:
-            return self.conn.execute(
-                """
+            sql = f"""
                 SELECT c.chunk_id, c.source_path, c.title, c.section, c.text,
                        bm25(chunks_fts, 2.0, 1.0, 1.5) as rank,
                        c.branch_hint,
@@ -372,21 +448,33 @@ class IndexStore:
                       c.page_number
                 FROM chunks_fts
                 JOIN chunks c ON c.chunk_id = chunks_fts.chunk_id
-                WHERE chunks_fts MATCH ?
+                WHERE chunks_fts MATCH ?{gen_filter}
                 ORDER BY rank
                 LIMIT ?
-                """,
-                (fts_query, top_k),
-            ).fetchall()
+                """
+            params = (fts_query,) + gen_param + (top_k,)
+            return self.conn.execute(sql, params).fetchall()
 
         try:
-            rows = run_fts(safe_query)
+            rows = run_fts(strict_query)
         except sqlite3.OperationalError:
-            tokens = [token for token in safe_query.split() if token]
-            fallback_query = " OR ".join(f'"{token}"' for token in tokens[:12])
-            if not fallback_query:
+            if not or_query:
                 return []
-            rows = run_fts(fallback_query)
+            rows = run_fts(or_query)
+
+        if len(rows) < top_k and or_query and or_query != strict_query:
+            try:
+                more_rows = run_fts(or_query)
+            except sqlite3.OperationalError:
+                more_rows = []
+            seen = {row["chunk_id"] for row in rows}
+            for row in more_rows:
+                if row["chunk_id"] in seen:
+                    continue
+                rows.append(row)
+                seen.add(row["chunk_id"])
+                if len(rows) >= top_k:
+                    break
 
         results: list[RetrievalResult] = []
         for row in rows:
@@ -408,19 +496,30 @@ class IndexStore:
         return results
 
     @staticmethod
-    def _safe_fts_query(query: str) -> str:
+    def _fts_tokens(query: str) -> list[str]:
         normalized = query.replace("\n", " ")
-        keep = []
-        for char in normalized:
-            if char.isalnum() or char in {"_", "-", " ", "/"}:
-                keep.append(char)
-            else:
-                keep.append(" ")
-        compact = " ".join("".join(keep).split())
-        if not compact:
-            return ""
-        terms = [term for term in compact.split(" ") if term]
-        return " ".join(f'"{term}"' for term in terms[:24])
+        lowered = re.sub(r"[^a-zA-Z0-9_\-\s/]", " ", normalized).lower()
+        terms = [term for term in lowered.split() if term]
+        stopwords = {
+            "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+            "to", "of", "in", "on", "for", "and", "or", "with", "at", "by",
+            "what", "which", "who", "how", "when", "where", "why", "tell", "me", "give",
+            "about", "from", "into", "that", "this", "these", "those",
+        }
+        filtered = [term for term in terms if len(term) >= 3 and term not in stopwords]
+        if "genai" in filtered:
+            filtered.extend(["generative", "llm", "models", "architecture"])
+
+        unique: list[str] = []
+        seen: set[str] = set()
+        for term in filtered:
+            if term in seen:
+                continue
+            unique.append(term)
+            seen.add(term)
+            if len(unique) >= 24:
+                break
+        return unique
 
     def get_sync_state(self, connector: str) -> dict[str, dict[str, str | None]]:
         rows = self.conn.execute(
@@ -535,43 +634,52 @@ class IndexStore:
         self,
         *,
         source_type: str,
+        source_id: str,
         enabled: bool,
         account_label: str | None,
         config_json: str | None,
     ) -> None:
         self.conn.execute(
             """
-            INSERT INTO source_connections (source_type, enabled, account_label, config_json, updated_at)
-            VALUES (?, ?, ?, ?, datetime('now'))
-            ON CONFLICT(source_type) DO UPDATE SET
+            INSERT INTO source_connections (source_type, source_id, enabled, account_label, config_json, updated_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(source_type, source_id) DO UPDATE SET
                 enabled=excluded.enabled,
                 account_label=excluded.account_label,
                 config_json=excluded.config_json,
                 updated_at=datetime('now')
             """,
-            (source_type, 1 if enabled else 0, account_label, config_json),
+            (source_type, source_id, 1 if enabled else 0, account_label, config_json),
         )
         self.conn.commit()
 
-    def disable_source_connection(self, source_type: str) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO source_connections (source_type, enabled, updated_at)
-            VALUES (?, 0, datetime('now'))
-            ON CONFLICT(source_type) DO UPDATE SET
-                enabled=0,
-                updated_at=datetime('now')
-            """,
-            (source_type,),
-        )
+    def disable_source_connection(self, source_type: str, source_id: str | None = None) -> None:
+        if source_id:
+            self.conn.execute(
+                """
+                UPDATE source_connections
+                SET enabled = 0, updated_at = datetime('now')
+                WHERE source_type = ? AND source_id = ?
+                """,
+                (source_type, source_id),
+            )
+        else:
+            self.conn.execute(
+                """
+                UPDATE source_connections
+                SET enabled = 0, updated_at = datetime('now')
+                WHERE source_type = ?
+                """,
+                (source_type,),
+            )
         self.conn.commit()
 
     def list_source_connections(self) -> list[sqlite3.Row]:
         rows = self.conn.execute(
             """
-            SELECT source_type, enabled, account_label, config_json, updated_at
+            SELECT source_type, source_id, enabled, account_label, config_json, updated_at
             FROM source_connections
-            ORDER BY source_type ASC
+            ORDER BY source_type ASC, source_id ASC
             """
         ).fetchall()
         return list(rows)
@@ -601,6 +709,68 @@ class IndexStore:
             (query, top_k, provider, retrieval_mode, git_branch, cwd, result_count),
         )
         self.conn.commit()
+
+    def get_or_create_generation(self, generation_id: str, embedding_profile_id: str, chunking_profile_id: str) -> None:
+        """Get or create an index generation."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        
+        try:
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO index_generations 
+                (generation_id, embedding_profile_id, chunking_profile_id, created_at, updated_at, is_active)
+                VALUES (?, ?, ?, ?, ?, 0)
+                """,
+                (generation_id, embedding_profile_id, chunking_profile_id, now, now),
+            )
+            self.conn.commit()
+        except Exception:
+            pass
+
+    def set_active_generation(self, generation_id: str) -> None:
+        """Set active index generation."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        
+        # First deactivate all
+        self.conn.execute("UPDATE index_generations SET is_active = 0")
+        # Then activate the specified one
+        self.conn.execute(
+            "UPDATE index_generations SET is_active = 1, updated_at = ? WHERE generation_id = ?",
+            (now, generation_id),
+        )
+        # Log migration
+        self.conn.execute(
+            "INSERT INTO migrations_log (to_generation, migration_type, details) VALUES (?, ?, ?)",
+            (generation_id, "activation", f"Switched to generation {generation_id}"),
+        )
+        self.conn.commit()
+
+    def get_active_generation(self) -> str | None:
+        """Get currently active generation ID."""
+        row = self.conn.execute(
+            "SELECT generation_id FROM index_generations WHERE is_active = 1 LIMIT 1"
+        ).fetchone()
+        return row["generation_id"] if row else None
+
+    def list_generations(self) -> list[dict]:
+        """List all index generations with stats."""
+        rows = self.conn.execute(
+            """
+            SELECT 
+                generation_id, 
+                embedding_profile_id, 
+                chunking_profile_id,
+                (SELECT COUNT(*) FROM chunks WHERE index_generation = ig.generation_id) as chunk_count,
+                (SELECT COUNT(DISTINCT source_path) FROM chunks WHERE index_generation = ig.generation_id) as source_count,
+                created_at,
+                is_active
+            FROM index_generations ig
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def recent_traces(self, limit: int = 10) -> list[sqlite3.Row]:
         rows = self.conn.execute(

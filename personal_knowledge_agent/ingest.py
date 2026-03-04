@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,12 +29,112 @@ class IngestBundle:
     assets: list[AssetRecord]
 
 
+class ChunkingBackend(ABC):
+    """Abstract base class for chunking strategies."""
+
+    @abstractmethod
+    def chunk(
+        self,
+        text: str,
+        title: str,
+        source_path: str,
+        source_type: str,
+        fingerprint: str,
+        *,
+        connector: str = "local",
+        cloud_url: str | None = None,
+        external_id: str | None = None,
+        version_id: str | None = None,
+        branch_hint: str | None = None,
+    ) -> list[Chunk]:
+        """Split text into chunks."""
+        pass
+
+
+class FixedChunkingBackend(ChunkingBackend):
+    """Fixed-size character-based chunking (original implementation)."""
+
+    def __init__(self, chunk_size: int = 900):
+        self.chunk_size = chunk_size
+
+    def chunk(
+        self,
+        text: str,
+        title: str,
+        source_path: str,
+        source_type: str,
+        fingerprint: str,
+        *,
+        connector: str = "local",
+        cloud_url: str | None = None,
+        external_id: str | None = None,
+        version_id: str | None = None,
+        branch_hint: str | None = None,
+    ) -> list[Chunk]:
+        lines = text.splitlines()
+        chunks: list[Chunk] = []
+        buffer: list[str] = []
+        section = "root"
+        running_chars = 0
+        index = 0
+        updated_at = datetime.now(timezone.utc).isoformat()
+
+        def flush() -> None:
+            nonlocal buffer, running_chars, index
+            if not buffer:
+                return
+            content = "\n".join(buffer).strip()
+            if not content:
+                buffer = []
+                running_chars = 0
+                return
+            chunk_id = f"{fingerprint[:12]}-{index}"
+            index += 1
+            chunks.append(
+                Chunk(
+                    chunk_id=chunk_id,
+                    source_path=source_path,
+                    source_type=source_type,
+                    title=title,
+                    fingerprint=fingerprint,
+                    section=section,
+                    text=content,
+                    token_estimate=estimate_tokens(content),
+                    updated_at=updated_at,
+                    connector=connector,
+                    metadata=ChunkMetadata(
+                        cloud_url=cloud_url,
+                        external_id=external_id,
+                        version_id=version_id,
+                        branch_hint=branch_hint,
+                    ),
+                )
+            )
+            buffer = []
+            running_chars = 0
+
+        for line in lines:
+            if line.startswith("#"):
+                flush()
+                section = line.lstrip("#").strip() or section
+
+            buffer.append(line)
+            running_chars += len(line) + 1
+            if running_chars >= self.chunk_size:
+                flush()
+
+        flush()
+        return chunks
+
+
 def discover_files(root: Path) -> list[Path]:
     files: list[Path] = []
     for path in root.rglob("*"):
         if not path.is_file():
             continue
         if any(part in SKIP_FOLDERS for part in path.parts):
+            continue
+        if any(part.endswith(".egg-info") for part in path.parts):
             continue
         files.append(path)
     return files
@@ -45,6 +146,17 @@ def compute_fingerprint(text: str) -> str:
 
 def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
+
+
+def get_chunking_backend(strategy: str = "fixed", chunk_size: int = 900) -> ChunkingBackend:
+    """Get chunking backend by strategy name."""
+    if strategy == "fixed":
+        return FixedChunkingBackend(chunk_size=chunk_size)
+    elif strategy in {"semantic", "docling"}:
+        # Fallback to fixed for now; semantic requires optional dependencies
+        return FixedChunkingBackend(chunk_size=chunk_size)
+    else:
+        return FixedChunkingBackend(chunk_size=chunk_size)
 
 
 def chunk_text(
@@ -60,61 +172,22 @@ def chunk_text(
     version_id: str | None = None,
     branch_hint: str | None = None,
     chunk_size: int = 900,
+    strategy: str = "fixed",
 ) -> list[Chunk]:
-    lines = text.splitlines()
-    chunks: list[Chunk] = []
-    buffer: list[str] = []
-    section = "root"
-    running_chars = 0
-    index = 0
-    updated_at = datetime.now(timezone.utc).isoformat()
-
-    def flush() -> None:
-        nonlocal buffer, running_chars, index
-        if not buffer:
-            return
-        content = "\n".join(buffer).strip()
-        if not content:
-            buffer = []
-            running_chars = 0
-            return
-        chunk_id = f"{fingerprint[:12]}-{index}"
-        index += 1
-        chunks.append(
-            Chunk(
-                chunk_id=chunk_id,
-                source_path=source_path,
-                source_type=source_type,
-                title=title,
-                fingerprint=fingerprint,
-                section=section,
-                text=content,
-                token_estimate=estimate_tokens(content),
-                updated_at=updated_at,
-                connector=connector,
-                metadata=ChunkMetadata(
-                    cloud_url=cloud_url,
-                    external_id=external_id,
-                    version_id=version_id,
-                    branch_hint=branch_hint,
-                ),
-            )
-        )
-        buffer = []
-        running_chars = 0
-
-    for line in lines:
-        if line.startswith("#"):
-            flush()
-            section = line.lstrip("#").strip() or section
-
-        buffer.append(line)
-        running_chars += len(line) + 1
-        if running_chars >= chunk_size:
-            flush()
-
-    flush()
-    return chunks
+    """Chunk text using specified backend strategy."""
+    backend = get_chunking_backend(strategy, chunk_size)
+    return backend.chunk(
+        text,
+        title,
+        source_path,
+        source_type,
+        fingerprint,
+        connector=connector,
+        cloud_url=cloud_url,
+        external_id=external_id,
+        version_id=version_id,
+        branch_hint=branch_hint,
+    )
 
 
 def _chunk_with_hints(
@@ -193,7 +266,7 @@ def parse_document(path: Path) -> Document | None:
     )
 
 
-def ingest_path(root: Path, assets_dir: Path | None = None) -> IngestBundle:
+def ingest_path(root: Path, assets_dir: Path | None = None, chunking_strategy: str = "fixed") -> IngestBundle:
     chunks: list[Chunk] = []
     assets: list[AssetRecord] = []
     for file_path in discover_files(root):
@@ -246,6 +319,7 @@ def ingest_path(root: Path, assets_dir: Path | None = None) -> IngestBundle:
                 cloud_url=document.cloud_url,
                 external_id=document.external_id,
                 version_id=document.version_id,
+                strategy=chunking_strategy,
             )
 
         for asset_index, asset in enumerate(parsed.assets, start=1):

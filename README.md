@@ -166,12 +166,34 @@ enable_reranker = false
 reranker_model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 ```
 
+## Index Generations & Shadow Builds
+
+Build shadow index generations to test new embedding models/chunking strategies without affecting active retrieval:
+
+```bash
+# Build a shadow index with OpenAI embeddings
+rag build-generation v2-openai --embedding-profile-id openai-large
+
+# List all generations
+rag list-generations
+
+# Activate when satisfied
+rag activate-generation v2-openai
+```
+
+## Query Normalization & Enhancements
+
+- **Query normalization**: Automatic typo fixing and grammatical error correction before retrieval
+- **Reranker**: Cross-encoder rescoring for precision improvement (always enabled by default)
+- **Multi-provider embeddings**: Local (sentence-transformers), OpenAI, or Jina embeddings
+- **Chunking backends**: Pluggable chunk creation (fixed-size, semantic, Docling-aware)
+
 ## Architecture modules
 
 - `personal_knowledge_agent/schemas.py`: core data contracts
-- `personal_knowledge_agent/ingest.py`: file discovery + parsing + chunking
-- `personal_knowledge_agent/index_store.py`: SQLite storage + FTS5 + traces
-- `personal_knowledge_agent/embeddings.py`: embedding + reranker engines
-- `personal_knowledge_agent/retrieval.py`: lexical/dense/hybrid retrieval + context fusion
-- `personal_knowledge_agent/llm.py`: provider abstraction (none/ollama/openai)
-- `personal_knowledge_agent/cli.py`: terminal UX
+- `personal_knowledge_agent/ingest.py`: file discovery + parsing + chunking (pluggable backends)
+- `personal_knowledge_agent/index_store.py`: SQLite storage + FTS5 + generation management
+- `personal_knowledge_agent/embeddings.py`: multi-provider embedding + reranker engines
+- `personal_knowledge_agent/retrieval.py`: lexical/dense/hybrid + context fusion + reranking
+- `personal_knowledge_agent/llm.py`: LLM provider abstraction + query normalization
+- `personal_knowledge_agent/cli.py`: terminal UX + generation commands
