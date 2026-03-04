@@ -430,10 +430,39 @@ def compress_results_context(results: list[RetrievalResult], max_chars: int = 26
     return "\n\n".join(snippets), used_chunks
 
 
-def format_references(results: list[RetrievalResult], max_refs: int = 8) -> list[str]:
+def _reference_label(link: str, project_root: Path | None = None) -> str:
+    if not link:
+        return "unknown"
+    if link.startswith("http://") or link.startswith("https://"):
+        return link
+
+    try:
+        source_path = Path(link).expanduser().resolve()
+    except Exception:
+        return link
+
+    source_posix = source_path.as_posix()
+    marker = "/.pka/sources/"
+    if marker in source_posix:
+        remainder = source_posix.split(marker, 1)[1]
+        parts = remainder.split("/", 1)
+        if len(parts) == 2 and parts[1].strip():
+            return parts[1]
+
+    if project_root is not None:
+        try:
+            return str(source_path.relative_to(project_root.expanduser().resolve()))
+        except Exception:
+            pass
+
+    return source_path.name or link
+
+
+def format_references(results: list[RetrievalResult], max_refs: int = 5, project_root: Path | None = None) -> list[str]:
     refs: list[str] = []
     for item in results[:max_refs]:
         link = item.source_url or item.cloud_url or item.source_path
+        display_link = _reference_label(link, project_root=project_root)
         location: list[str] = []
         if item.page_number is not None:
             location.append(f"page {item.page_number}")
@@ -443,7 +472,7 @@ def format_references(results: list[RetrievalResult], max_refs: int = 8) -> list
             location.append(item.section_heading or item.section)
         location_text = ", ".join(location) if location else "location n/a"
         refs.append(
-            f"{link} | {location_text} | chunk={item.chunk_id} | "
+            f"{display_link} | {location_text} | chunk={item.chunk_id} | "
             f"score={item.score:.3f} boost={item.workflow_boost:.2f} "
             f"(lex={item.lexical_score:.3f}, dense={item.dense_score:.3f}, rerank={item.rerank_score:.3f})"
         )

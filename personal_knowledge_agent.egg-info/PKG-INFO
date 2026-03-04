@@ -165,23 +165,16 @@ rag sync
 
 Only changed cloud documents are pulled (Google Drive by `version`, Notion by `last_edited_time`). Synced files are indexed automatically.
 
-## Google Drive legacy public-folder workflow
+## Google Drive workflow
 
-Sync a public Google Drive folder into local cache:
-
-```bash
-uv run pka drive-sync "https://drive.google.com/drive/folders/<FOLDER_ID>?usp=sharing"
-```
-
-Sync + index in one command:
+Connect your Drive folder once, then use regular sync/index flow:
 
 ```bash
-uv run pka drive-index "https://drive.google.com/drive/folders/<FOLDER_ID>?usp=sharing"
+rag sources connect google_drive --folder-id <FOLDER_ID>
+rag sync
 ```
 
-By default files are stored under `.pka/sources/google-drive`.
-
-Run `drive-index` repeatedly as you update your Drive folder; indexing is incremental.
+By default files are stored under `.pka/sources/google-drive` and are indexed incrementally on each `rag sync`.
 
 ## LLM modes
 

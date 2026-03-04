@@ -80,6 +80,24 @@ def _normalized_score(item_score: float, max_score: float) -> float:
     return ratio * 100.0
 
 
+def _print_answer_panel(answer_text: str) -> None:
+    console.print(Panel(answer_text, title="Grounded Answer", border_style="cyan"))
+
+
+def _print_references(results: list, settings=None) -> None:
+    refs_output = format_references(
+        results,
+        max_refs=5,
+        project_root=(settings.project_root if settings else None),
+    )
+    console.rule("References")
+    if refs_output:
+        for line in refs_output:
+            console.print(f"- {line}")
+    else:
+        console.print("- No references")
+
+
 def _llm_key_status(provider: str) -> str:
     normalized = provider.strip().lower()
     if normalized in {"none", ""}:
@@ -415,6 +433,7 @@ def sync() -> None:
 
     drive_targets: list[tuple[str, Path, str]] = []
     notion_targets: list[tuple[str, Path]] = []
+    local_targets: list[Path] = []
     with _store() as store:
         for connection in store.list_source_connections():
             if not bool(connection["enabled"]):
@@ -439,6 +458,10 @@ def sync() -> None:
                 target_destination = Path(str(config_data.get("destination") or notion_destination))
                 if target_root:
                     notion_targets.append((target_root, target_destination))
+            elif source_type == "local":
+                local_path = str(config_data.get("path") or "").strip()
+                if local_path:
+                    local_targets.append(Path(local_path).expanduser().resolve())
 
     if not drive_targets and folder_id:
         drive_targets.append((folder_id, destination, account_label))
@@ -447,7 +470,15 @@ def sync() -> None:
 
     drive_status_lines: list[str] = []
     notion_status_lines: list[str] = []
+    local_status_lines: list[str] = []
     sync_paths: list[Path] = []
+
+    for target_path in local_targets:
+        if target_path.exists():
+            rag_build(path=str(target_path))
+            local_status_lines.append(f"path={target_path} indexed")
+        else:
+            local_status_lines.append(f"path={target_path} missing")
     if drive_targets:
         token_payload = load_token("google-drive")
         if not token_payload:
@@ -506,6 +537,7 @@ def sync() -> None:
     table = Table(title="RAG Sync")
     table.add_column("Connector")
     table.add_column("Status")
+    table.add_row("local", "\n".join(local_status_lines) if local_status_lines else "skipped")
     table.add_row("google-drive", "\n".join(drive_status_lines) if drive_status_lines else "skipped")
     table.add_row("notion", "\n".join(notion_status_lines) if notion_status_lines else "skipped")
     console.print(table)
@@ -659,7 +691,7 @@ def status_alias() -> None:
 @app.command()
 def search(
     query: str = typer.Argument(...),
-    top_k: int = typer.Option(8, min=1, max=30),
+    top_k: int = typer.Option(5, min=1, max=5),
     mode: str | None = typer.Option(None, help="Override retrieval mode: lexical | dense | hybrid"),
 ) -> None:
     from .llm import normalize_query
@@ -678,36 +710,19 @@ def search(
         _, results, used_mode = retrieve_with_context(store, vector_store, query, context_root, top_k, settings)
 
     if not results:
-        console.print("No results.")
+        _print_answer_panel("No grounded evidence found in the local index. Try `rag build <path>` or adjust your query.")
+        _print_references([], settings=settings)
         return
 
-    table = Table(title=f"Search Results ({len(results)}) mode={used_mode}")
-    max_score = max((item.score for item in results), default=0.0)
-    table.add_column("Confidence", justify="right")
-    table.add_column("Lex", justify="right")
-    table.add_column("Dense", justify="right")
-    table.add_column("Source")
-    table.add_column("Section")
-    table.add_column("Snippet")
-    for item in results:
-        snippet = " ".join(item.text.split())
-        if len(snippet) > 120:
-            snippet = snippet[:120].rstrip() + "…"
-        table.add_row(
-            f"{_normalized_score(item.score, max_score):.1f}%",
-            f"{item.lexical_score:.3f}",
-            f"{item.dense_score:.3f}",
-            item.source_path,
-            item.section_heading or item.section,
-            snippet,
-        )
-    console.print(table)
+    response = build_extractive_answer(query, results)
+    _print_answer_panel(response)
+    _print_references(results, settings=settings)
 
 
 @app.command()
 def ask(
     question: str = typer.Argument(...),
-    top_k: int = typer.Option(8, min=1, max=30),
+    top_k: int = typer.Option(5, min=1, max=5),
     cwd: str = typer.Option(".", help="Workflow context directory"),
     mode: str | None = typer.Option(None, help="Override retrieval mode: lexical | dense | hybrid"),
     debug: bool = typer.Option(False, "--debug", help="Show retrieval trace"),
@@ -751,7 +766,7 @@ def ask(
             result_count=len(results),
         )
 
-    refs_output = format_references(results)
+    refs_output = format_references(results, max_refs=5, project_root=settings.project_root)
 
     if refs:
         console.rule("References")
@@ -799,14 +814,8 @@ def ask(
             )
         console.print(topk)
 
-    console.print(Panel(response, title="Grounded Answer", border_style="cyan"))
-
-    console.rule("References")
-    if refs_output:
-        for line in refs_output:
-            console.print(f"- {line}")
-    else:
-        console.print("- No references")
+    _print_answer_panel(response)
+    _print_references(results, settings=settings)
 
     if verbose or show_rewrite:
         console.rule("Workflow Context")
