@@ -1,42 +1,20 @@
 # personal-knowledge-agent
 
-Workspace-aware, local-first RAG assistant for developers.
+Local-first, terminal-based personal RAG assistant for developers.
 
-## Version 2 (V2)
+## What it does
 
-V2 upgrades the project from a terminal-only tool to a persistent local assistant with a daemon API and multi-client access.
-
-### What’s new in V2
-
-- FastAPI daemon on `127.0.0.1:8741`
-- Workspace registry persisted at `~/.pka/workspaces.json`
-- Workspace-aware routing from `workspace_hint` or `active_file`
-- Shared request schema across CLI, Chrome, and VS Code clients
-- Local auth token (`~/.pka/daemon_token`) required via `X-RAG-Token`
-- Chrome extension client (`clients/chrome-extension/`)
-- VS Code extension client (`clients/vscode-extension/`)
-- Dedicated Drive workspace (`drive://default`) and connector abstraction
-
-## V2 architecture
-
-```text
-Chrome Extension      VSCode Extension      CLI
-			│                     │                │
-			└──────────────┬──────┴────────────────┘
-										 ▼
-					FastAPI Daemon (localhost:8741)
-										 │
-			 WorkspaceRegistry + RAG Core Pipeline
-										 │
-			per-workspace SQLite + vector stores
-```
+- Indexes local project/docs into a local `.pka/` store.
+- Retrieves relevant chunks with lexical/dense/hybrid modes.
+- Answers questions with grounded references in the terminal.
+- Optionally syncs from Google Drive / Notion connectors.
 
 ## Install
 
 ```bash
 uv venv .venv
 source .venv/bin/activate
-uv pip install -e .[daemon]
+uv pip install -e .
 ```
 
 For full local + cloud stack:
@@ -45,79 +23,51 @@ For full local + cloud stack:
 uv pip install -e .[full]
 ```
 
-## V2 quick usage
+## Local quick start
 
-1. Initialize project settings
+1) Initialize project settings:
 
 ```bash
 rag init
 ```
 
-2. Register and index a workspace
+2) Build index from current folder (or any path):
 
 ```bash
-rag init-workspace .
+rag build .
 ```
 
-3. Start daemon
+3) Ask a question:
 
 ```bash
-rag daemon start
+rag ask "How does retrieval work in this project?"
 ```
 
-4. Check daemon and workspace state
+## Core commands
 
 ```bash
-rag daemon status
-rag workspace list
+rag init
+rag build <path>
+rag index <path>     # alias of build
+rag search "<query>"
+rag ask "<question>"
+rag doctor
+rag status
+rag trace "<query>"
 ```
 
-5. Query via CLI (core path still supported)
+## Connector commands (optional)
 
 ```bash
-rag ask "How does retrieval routing work in V2?"
-```
-
-## New CLI commands in V2
-
-```bash
-rag daemon start|stop|status
-rag init-workspace <path>
-rag workspace list|remove
+rag sources list
+rag sources connect local --path /path/to/docs
+rag sources connect google_drive --folder-id <FOLDER_ID>
+rag auth google-drive --client-secret-file client_secret.json
+rag sync
 rag drive auth|sync|status
 ```
 
-## Daemon API (V2)
-
-- `GET /health`
-- `POST /query`
-- `POST /ingest`
-- `GET /workspaces`
-- `POST /workspaces`
-
-`POST /query` accepts:
-
-```json
-{
-	"query": "string",
-	"workspace_hint": "/absolute/path/or/drive://default",
-	"clipboard_context": "optional user-selected text",
-	"active_file": "/absolute/path/to/file",
-	"active_code_selection": "optional highlighted code"
-}
-```
-
-## Security (local daemon)
-
-- Token file: `~/.pka/daemon_token`
-- Clients must send: `X-RAG-Token: <token>`
-
-## Client locations
-
-- Chrome extension: `clients/chrome-extension/`
-- VS Code extension: `clients/vscode-extension/`
-
 ## Notes
 
-- Existing RAG core modules remain intact (`retrieve_with_context`, `generate_answer`, `ingest_path`).
-- V2 wraps and exposes the core through a persistent daemon and client integrations.
+- Use `rag --help` to view all command groups and options.
+- `rag build` / `rag index` is the current indexing path (not `rag ingest`).

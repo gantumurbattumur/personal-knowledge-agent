@@ -44,10 +44,17 @@ export class RagClient {
         });
 
         if (!resp.ok) {
-            const body = await resp.json().catch(() => ({}));
-            const detail = body.detail;
+            const body: unknown = await resp.json().catch(() => ({}));
+            const detail =
+                typeof body === "object" && body !== null && "detail" in body
+                    ? (body as { detail?: unknown }).detail
+                    : undefined;
             if (typeof detail === "object" && detail !== null) {
-                const err = new Error(detail.error || `HTTP ${resp.status}`);
+                const detailError =
+                    "error" in detail && typeof (detail as { error?: unknown }).error === "string"
+                        ? (detail as { error: string }).error
+                        : undefined;
+                const err = new Error(detailError || `HTTP ${resp.status}`);
                 (err as any).detail = detail;
                 throw err;
             }
