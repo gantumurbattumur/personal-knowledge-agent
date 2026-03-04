@@ -1,1 +1,3 @@
+connectors
+daemon
 personal_knowledge_agent

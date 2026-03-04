@@ -39,7 +39,13 @@ chunking = [
 query = [
   "pyspellchecker>=0.8.0",
 ]
+daemon = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.32.0",
+]
 full = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.32.0",
   "pypdf>=4.2.0",
   "docling>=2.0.0",
   "ebooklib>=0.18",
@@ -62,4 +68,4 @@ rag = "personal_knowledge_agent.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["personal_knowledge_agent*"]
+include = ["personal_knowledge_agent*", "daemon*", "connectors*"]

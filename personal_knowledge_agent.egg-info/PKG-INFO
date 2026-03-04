@@ -38,7 +38,12 @@ Provides-Extra: chunking
 Requires-Dist: semantic-text-splitter>=0.8.0; extra == "chunking"
 Provides-Extra: query
 Requires-Dist: pyspellchecker>=0.8.0; extra == "query"
+Provides-Extra: daemon
+Requires-Dist: fastapi>=0.115.0; extra == "daemon"
+Requires-Dist: uvicorn[standard]>=0.32.0; extra == "daemon"
 Provides-Extra: full
+Requires-Dist: fastapi>=0.115.0; extra == "full"
+Requires-Dist: uvicorn[standard]>=0.32.0; extra == "full"
 Requires-Dist: pypdf>=4.2.0; extra == "full"
 Requires-Dist: docling>=2.0.0; extra == "full"
 Requires-Dist: ebooklib>=0.18; extra == "full"
@@ -81,19 +86,13 @@ source .venv/bin/activate
 uv pip install -e .
 ```
 
-Install workflow + connector stack:
+Install workflow + connector stack (recommended):
 
 ```bash
 uv pip install -e .[full]
 ```
 
-Install full ingestion + hybrid retrieval extras:
-
-```bash
-uv pip install -e .[full]
-```
-
-Install only Google Drive support:
+Install only Google Drive support (optional minimal install):
 
 ```bash
 uv pip install -e .[gdrive]
@@ -109,6 +108,12 @@ Index your project/documents:
 
 ```bash
 rag index .
+```
+
+Incremental update for local folders (new/changed files only):
+
+```bash
+rag build /path/to/folder
 ```
 
 Search the index:
@@ -135,6 +140,48 @@ Ask using lexical-only fallback:
 rag ask "What did I write about retrieval evaluation?" --mode lexical
 ```
 
+## Multi-source setup (local + cloud)
+
+You can connect multiple sources at the same time, each with a unique `--source-id`.
+
+### Connect multiple local folders
+
+```bash
+rag sources connect local --path ~/Documents --source-id docs
+rag sources connect local --path ~/Notes --source-id notes
+rag sources connect local --path ~/Research --source-id research
+```
+
+### Connect multiple Google Drive folders
+
+Authenticate once:
+
+```bash
+rag auth google-drive --client-secret-file client_secret.json
+```
+
+Then connect one or more Drive folders:
+
+```bash
+rag sources connect google_drive --folder-id <FOLDER_ID_1> --destination .pka/sources/google-drive/work --source-id gdrive-work
+rag sources connect google_drive --folder-id <FOLDER_ID_2> --destination .pka/sources/google-drive/personal --source-id gdrive-personal
+```
+
+### Connect Notion roots
+
+```bash
+rag auth notion --client-id <id>
+rag auth notion --client-id <id> --client-secret <secret> --code <oauth_code>
+rag sources connect notion --root-page-id <ROOT_PAGE_ID_1> --source-id notion-main
+rag sources connect notion --root-page-id <ROOT_PAGE_ID_2> --source-id notion-wiki
+```
+
+List all connected sources:
+
+```bash
+rag sources list
+```
+
 ## Cloud auth and sync
 
 Authenticate connectors (tokens stored in system keyring):
@@ -150,7 +197,7 @@ rag auth notion --client-id <id>
 rag auth notion --client-id <id> --client-secret <secret> --code <oauth_code>
 ```
 
-Run incremental sync:
+Run incremental cloud sync (new/changed cloud docs only):
 
 ```bash
 rag sync
@@ -165,16 +212,26 @@ rag sync
 
 Only changed cloud documents are pulled (Google Drive by `version`, Notion by `last_edited_time`). Synced files are indexed automatically.
 
-## Google Drive workflow
+## Incremental indexing workflow (new files only)
 
-Connect your Drive folder once, then use regular sync/index flow:
+Use these commands day-to-day to index only new/changed content:
 
 ```bash
-rag sources connect google_drive --folder-id <FOLDER_ID>
+# 1) pull + index only changed cloud files
 rag sync
+
+# 2) index only changed/new local files in a folder
+rag build ~/Documents
+rag build ~/Notes
 ```
 
-By default files are stored under `.pka/sources/google-drive` and are indexed incrementally on each `rag sync`.
+Behavior summary:
+
+- `rag sync` = incremental for all connected cloud sources.
+- `rag build <path>` = incremental for that local path.
+- Unchanged chunks are skipped automatically.
+
+If files were deleted/renamed and you want a strict clean corpus, rebuild from scratch (remove `.pka/`, run `rag init`, reconnect sources, then `rag sync` + `rag build` as needed).
 
 ## LLM modes
 

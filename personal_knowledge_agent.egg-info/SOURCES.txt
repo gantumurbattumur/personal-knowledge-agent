@@ -1,5 +1,11 @@
 README.md
 pyproject.toml
+connectors/__init__.py
+connectors/drive.py
+daemon/__init__.py
+daemon/auth_token.py
+daemon/registry.py
+daemon/server.py
 personal_knowledge_agent/__init__.py
 personal_knowledge_agent/auth.py
 personal_knowledge_agent/cli.py

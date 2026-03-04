@@ -1006,5 +1006,262 @@ def info() -> None:
     console.print(index_summary)
 
 
+# ---------------------------------------------------------------------------
+# Daemon management commands
+# ---------------------------------------------------------------------------
+
+daemon_app = typer.Typer(help="Manage the background RAG daemon")
+app.add_typer(daemon_app, name="daemon")
+
+drive_app = typer.Typer(help="Google Drive integration")
+app.add_typer(drive_app, name="drive")
+
+workspace_app = typer.Typer(help="Manage registered workspaces")
+app.add_typer(workspace_app, name="workspace")
+
+
+@daemon_app.command("start")
+def daemon_start(
+    port: int = typer.Option(8741, help="Port to run the daemon on"),
+    warm: bool = typer.Option(True, help="Pre-load all models immediately on start"),
+    reload: bool = typer.Option(False, help="Enable auto-reload for development"),
+    background: bool = typer.Option(False, help="Run daemon in background"),
+) -> None:
+    """Start the PKA daemon."""
+    import subprocess
+    import sys
+
+    daemon_cmd = [
+        sys.executable, "-m", "uvicorn",
+        "daemon.server:app",
+        "--host", "127.0.0.1",
+        "--port", str(port),
+    ]
+    if reload:
+        daemon_cmd.append("--reload")
+
+    console.print(f"Starting PKA daemon on http://127.0.0.1:{port} ...")
+
+    if background:
+        proc = subprocess.Popen(
+            daemon_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        pid_path = Path.home() / ".pka" / "daemon.pid"
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(str(proc.pid), encoding="utf-8")
+        console.print(f"Daemon started in background (PID {proc.pid})")
+        _print_daemon_token()
+    else:
+        _print_daemon_token()
+        subprocess.run(daemon_cmd, check=False)
+
+
+@daemon_app.command("stop")
+def daemon_stop() -> None:
+    """Stop the running PKA daemon."""
+    import signal
+
+    pid_path = Path.home() / ".pka" / "daemon.pid"
+    if not pid_path.exists():
+        console.print("[yellow]No daemon PID file found. Is the daemon running?[/]")
+        return
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+        os.kill(pid, signal.SIGTERM)
+        pid_path.unlink(missing_ok=True)
+        console.print(f"Daemon (PID {pid}) stopped.")
+    except ProcessLookupError:
+        pid_path.unlink(missing_ok=True)
+        console.print("[yellow]Daemon process not found (already stopped).[/]")
+    except Exception as exc:
+        console.print(f"[red]Failed to stop daemon: {exc}[/]")
+
+
+@daemon_app.command("status")
+def daemon_status() -> None:
+    """Check if the PKA daemon is running."""
+    import urllib.request
+    import urllib.error
+
+    try:
+        req = urllib.request.Request("http://127.0.0.1:8741/health")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        console.print(f"[green]Daemon running[/] — workspaces loaded: {data.get('workspaces_loaded', '?')}")
+    except (urllib.error.URLError, OSError):
+        console.print("[red]Daemon is not running.[/] Start with: rag daemon start")
+
+
+def _print_daemon_token() -> None:
+    """Display the daemon auth token for client configuration."""
+    token_path = Path.home() / ".pka" / "daemon_token"
+    if token_path.exists():
+        token = token_path.read_text(encoding="utf-8").strip()
+        console.print(f"Auth token: {token[:8]}…  (full token in ~/.pka/daemon_token)")
+
+
+# ---------------------------------------------------------------------------
+# Workspace management commands
+# ---------------------------------------------------------------------------
+
+
+@app.command("init-workspace")
+def init_workspace(
+    path: str = typer.Argument(".", help="Workspace path to register and index"),
+) -> None:
+    """Register a directory as a workspace and index it."""
+    from daemon.registry import WorkspaceRegistry
+
+    root = Path(path).expanduser().resolve()
+    if not root.is_dir():
+        raise typer.BadParameter(f"Not a directory: {root}")
+
+    # Ensure .pka dir exists
+    pka_dir = root / ".pka"
+    pka_dir.mkdir(parents=True, exist_ok=True)
+
+    registry = WorkspaceRegistry.load()
+    ws = registry.register(str(root), kind="local")
+    console.print(f"Registered workspace: {ws.path}")
+    console.print(f"  id:      {ws.id}")
+    console.print(f"  db_path: {ws.db_path}")
+
+    # Trigger indexing
+    console.print("Indexing workspace…")
+    settings = load_settings(root)
+    bundle = ingest_path(root, assets_dir=settings.cache_dir / "assets")
+    with IndexStore(Path(ws.db_path)) as store:
+        inserted, skipped, _updated = store.upsert_chunks(bundle.chunks)
+        assets = store.upsert_assets([a.model_dump() for a in bundle.assets]) if bundle.assets else 0
+    console.print(f"Indexed: inserted={inserted}, skipped={skipped}, assets={assets}")
+
+
+@workspace_app.command("list")
+def workspace_list() -> None:
+    """List all registered workspaces."""
+    from daemon.registry import WorkspaceRegistry
+
+    registry = WorkspaceRegistry.load()
+    workspaces = registry.list_all()
+    if not workspaces:
+        console.print("[yellow]No workspaces registered.[/] Run: rag init-workspace /path/to/repo")
+        return
+
+    table = Table(title="Registered Workspaces")
+    table.add_column("ID")
+    table.add_column("Path")
+    table.add_column("Kind")
+    table.add_column("DB Path")
+    table.add_column("Last Indexed")
+    for ws in workspaces:
+        table.add_row(ws["id"], ws["path"], ws["kind"], ws["db_path"], ws.get("last_indexed", "-"))
+    console.print(table)
+
+
+@workspace_app.command("remove")
+def workspace_remove(
+    path: str = typer.Argument(..., help="Workspace path to remove from registry"),
+) -> None:
+    """Remove a workspace from the registry (does not delete files)."""
+    from daemon.registry import WorkspaceRegistry
+
+    registry = WorkspaceRegistry.load()
+    resolved = str(Path(path).expanduser().resolve())
+    if registry.unregister(resolved):
+        console.print(f"Removed workspace: {resolved}")
+    else:
+        console.print(f"[yellow]Workspace not found: {resolved}[/]")
+
+
+# ---------------------------------------------------------------------------
+# Google Drive CLI commands
+# ---------------------------------------------------------------------------
+
+
+@drive_app.command("auth")
+def drive_auth(
+    client_secret_file: str = typer.Option("client_secret.json", help="OAuth client secret JSON"),
+) -> None:
+    """Run OAuth2 flow for Google Drive."""
+    result = auth_google_drive(client_secret_file=client_secret_file)
+    if result.ok:
+        console.print(f"[green]{result.message}[/]")
+    else:
+        console.print(f"[red]{result.message}[/]")
+        raise typer.Exit(1)
+
+
+@drive_app.command("sync")
+def drive_sync(
+    folder_id: str = typer.Option("", envvar="GOOGLE_DRIVE_FOLDER_ID", help="Drive folder ID to sync"),
+    destination: str = typer.Option("", envvar="GOOGLE_DRIVE_DEST", help="Local destination for downloads"),
+) -> None:
+    """Pull changes from Google Drive and re-index."""
+    settings = load_settings()
+    token = load_token("google-drive")
+    if not token:
+        console.print("[red]Not authenticated with Google Drive.[/] Run: rag drive auth")
+        raise typer.Exit(1)
+
+    if not folder_id:
+        folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
+    if not folder_id:
+        console.print("[red]No Drive folder configured.[/] Set GOOGLE_DRIVE_FOLDER_ID in .env")
+        raise typer.Exit(1)
+
+    dest = Path(destination or os.environ.get("GOOGLE_DRIVE_DEST", ".pka/sources/google-drive"))
+    if not dest.is_absolute():
+        dest = settings.project_root / dest
+    dest.mkdir(parents=True, exist_ok=True)
+
+    console.print(f"Syncing Drive folder {folder_id} → {dest}")
+    with _store() as store:
+        result = sync_google_drive_incremental(
+            folder_id=folder_id,
+            destination=dest,
+            token_payload=token,
+            store=store,
+        )
+    console.print(f"Downloaded: {result.downloaded}, skipped: {result.skipped}")
+
+    # Register Drive workspace in registry
+    from daemon.registry import WorkspaceRegistry
+    registry = WorkspaceRegistry.load()
+    registry.register("drive://default", kind="drive")
+    console.print("Drive workspace registered. Re-indexing…")
+
+    # Re-index the downloaded files
+    bundle = ingest_path(dest, assets_dir=settings.cache_dir / "assets")
+    drive_db = Path.home() / ".pka" / "drive" / "index.sqlite3"
+    with IndexStore(drive_db) as store:
+        inserted, skipped, _updated = store.upsert_chunks(bundle.chunks)
+    console.print(f"Indexed: inserted={inserted}, skipped={skipped}")
+
+
+@drive_app.command("status")
+def drive_status() -> None:
+    """Show Google Drive sync status."""
+    drive_db = Path.home() / ".pka" / "drive" / "index.sqlite3"
+    if not drive_db.exists():
+        console.print("[yellow]Drive workspace not initialized. Run: rag drive sync[/]")
+        return
+
+    with IndexStore(drive_db) as store:
+        stats = store.stats()
+        sync_state = store.get_sync_state("google_drive")
+
+    table = Table(title="Google Drive Status")
+    table.add_column("Metric")
+    table.add_column("Value")
+    table.add_row("chunks", str(stats["chunk_count"]))
+    table.add_row("sources", str(stats["source_count"]))
+    table.add_row("last_sync", str(sync_state.get("last_synced", "-")))
+    table.add_row("db_size", f"{drive_db.stat().st_size / 1024:.1f} KB")
+    console.print(table)
+
+
 if __name__ == "__main__":
     app()
