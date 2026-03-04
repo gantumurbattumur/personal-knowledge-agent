@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 from dataclasses import dataclass
 from urllib import request
 
@@ -9,6 +11,23 @@ from urllib import request
 class EmbeddingStatus:
     enabled: bool
     reason: str
+
+
+@contextlib.contextmanager
+def _suppress_model_load_output():
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    stdout_fd = os.dup(1)
+    stderr_fd = os.dup(2)
+    try:
+        os.dup2(devnull_fd, 1)
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        os.dup2(stdout_fd, 1)
+        os.dup2(stderr_fd, 2)
+        os.close(stdout_fd)
+        os.close(stderr_fd)
+        os.close(devnull_fd)
 
 
 class EmbeddingEngine:
@@ -44,12 +63,13 @@ class EmbeddingEngine:
             return
 
         try:
-            self._model = SentenceTransformer(self.model_name)
+            with _suppress_model_load_output():
+                self._model = SentenceTransformer(self.model_name)
+                # Get embedding dimension
+                dummy = self._model.encode(["test"])
+                self._dims = len(dummy[0]) if len(dummy) > 0 else 384
             self._enabled = True
             self._reason = "ok"
-            # Get embedding dimension
-            dummy = self._model.encode(["test"])
-            self._dims = len(dummy[0]) if len(dummy) > 0 else 384
         except Exception as exc:
             self._enabled = False
             self._reason = f"failed to load model: {exc}"
@@ -213,7 +233,8 @@ class RerankerEngine:
             return
 
         try:
-            self._model = CrossEncoder(self.model_name)
+            with _suppress_model_load_output():
+                self._model = CrossEncoder(self.model_name)
             self._reason = "ok"
         except Exception as exc:
             self.enabled = False
