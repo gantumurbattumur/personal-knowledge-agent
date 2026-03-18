@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 from dataclasses import dataclass
 from urllib import request
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -76,8 +80,6 @@ class EmbeddingEngine:
 
     def _load_openai(self) -> None:
         """Check OpenAI API availability."""
-        import os
-        
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             self._enabled = False
@@ -93,8 +95,6 @@ class EmbeddingEngine:
 
     def _load_jina(self) -> None:
         """Check Jina API availability."""
-        import os
-        
         api_key = os.getenv("JINA_API_KEY")
         if not api_key:
             self._enabled = False
@@ -132,8 +132,6 @@ class EmbeddingEngine:
 
     def _encode_openai(self, texts: list[str]) -> list[list[float]]:
         """Encode using OpenAI API."""
-        import os
-        
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             return []
@@ -166,13 +164,12 @@ class EmbeddingEngine:
             embeddings_data = result.get("data", [])
             embeddings_data.sort(key=lambda x: x.get("index", 0))
             return [item["embedding"] for item in embeddings_data]
-        except Exception:
+        except Exception as exc:
+            logger.warning("OpenAI embedding request failed for model %s: %s", model, exc)
             return []
 
     def _encode_jina(self, texts: list[str]) -> list[list[float]]:
         """Encode using Jina API."""
-        import os
-        
         api_key = os.getenv("JINA_API_KEY")
         if not api_key:
             return []
@@ -199,7 +196,8 @@ class EmbeddingEngine:
             embeddings_data = result.get("data", [])
             embeddings_data.sort(key=lambda x: x.get("index", 0))
             return [item["embedding"] for item in embeddings_data]
-        except Exception:
+        except Exception as exc:
+            logger.warning("Jina embedding request failed for model %s: %s", self.model_name, exc)
             return []
 
     def encode_query(self, text: str) -> list[float] | None:

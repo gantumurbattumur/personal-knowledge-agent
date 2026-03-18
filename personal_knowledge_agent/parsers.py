@@ -210,14 +210,10 @@ def parse_epub(path: Path) -> str:
 
 
 def parse_by_extension(path: Path) -> tuple[str, str] | None:
-    suffix = path.suffix.lower()
-    if suffix in TEXT_EXTENSIONS:
-        return parse_text_file(path), "text"
-    if suffix == ".pdf":
-        return parse_pdf(path).text, "pdf"
-    if suffix == ".epub":
-        return parse_epub(path), "epub"
-    return None
+    parsed = parse_document_with_metadata(path)
+    if parsed is None:
+        return None
+    return parsed.text, parsed.source_type
 
 
 def parse_document_with_metadata(path: Path, assets_dir: Path | None = None) -> ParsedDocumentResult | None:

@@ -65,6 +65,9 @@ class Chunk(BaseModel):
     token_estimate: int
     updated_at: str
     connector: str = "local"
+    index_generation: str = "v1"
+    chunking_profile_id: str | None = None
+    embedding_profile_id: str | None = None
     metadata: ChunkMetadata = Field(default_factory=ChunkMetadata)
 
 

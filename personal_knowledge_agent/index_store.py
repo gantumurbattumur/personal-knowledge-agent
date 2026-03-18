@@ -253,9 +253,10 @@ class IndexStore:
                 INSERT INTO chunks (
                     chunk_id, source_path, source_type, title, fingerprint, section, text,
                     token_estimate, updated_at, connector, page_number, bounding_box_json,
-                    cloud_url, image_description, external_id, version_id, branch_hint
+                    cloud_url, image_description, external_id, version_id, branch_hint,
+                    index_generation, chunking_profile_id, embedding_profile_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chunk_id) DO UPDATE SET
                     source_path=excluded.source_path,
                     source_type=excluded.source_type,
@@ -272,7 +273,10 @@ class IndexStore:
                     image_description=excluded.image_description,
                     external_id=excluded.external_id,
                     version_id=excluded.version_id,
-                    branch_hint=excluded.branch_hint
+                    branch_hint=excluded.branch_hint,
+                    index_generation=excluded.index_generation,
+                    chunking_profile_id=excluded.chunking_profile_id,
+                    embedding_profile_id=excluded.embedding_profile_id
                 """,
                 (
                     chunk.chunk_id,
@@ -292,6 +296,9 @@ class IndexStore:
                     chunk.metadata.external_id,
                     chunk.metadata.version_id,
                     chunk.metadata.branch_hint,
+                    chunk.index_generation,
+                    chunk.chunking_profile_id,
+                    chunk.embedding_profile_id,
                 ),
             )
             self.conn.execute(
@@ -308,17 +315,20 @@ class IndexStore:
         self.conn.commit()
         return inserted, skipped, updated_chunks
 
-    def chunks_missing_embeddings(self, embedding_model: str) -> list[Chunk]:
-        rows = self.conn.execute(
-            """
+    def chunks_missing_embeddings(self, embedding_model: str, index_generation: str | None = None) -> list[Chunk]:
+        query = """
             SELECT c.chunk_id, c.source_path, c.source_type, c.title, c.fingerprint, c.section, c.text, c.token_estimate, c.updated_at, c.connector
             FROM chunks c
             LEFT JOIN chunk_embeddings e
                 ON e.chunk_id = c.chunk_id AND e.embedding_model = ?
             WHERE e.chunk_id IS NULL
-            """,
-            (embedding_model,),
-        ).fetchall()
+        """
+        params: list[str] = [embedding_model]
+        if index_generation is not None:
+            query += " AND c.index_generation = ?"
+            params.append(index_generation)
+
+        rows = self.conn.execute(query, tuple(params)).fetchall()
         return [
             Chunk(
                 chunk_id=row["chunk_id"],

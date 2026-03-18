@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import sys
@@ -35,6 +36,7 @@ rag_app = typer.Typer(help="RAG indexing and status")
 app.add_typer(sources_app, name="sources")
 app.add_typer(rag_app, name="rag")
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def _store() -> IndexStore:
@@ -69,7 +71,8 @@ def _source_id_for(source_type: str, config: dict) -> str:
 def _token_status(service: str) -> str:
     try:
         return "ok" if load_token(service) else "missing"
-    except Exception:
+    except Exception as exc:
+        logger.debug("Token status check failed for service %s: %s", service, exc)
         return "disabled (keyring missing)"
 
 
@@ -146,7 +149,8 @@ def _connected_services(store: IndexStore) -> dict[str, dict]:
         if config_raw:
             try:
                 parsed = json.loads(str(config_raw))
-            except Exception:
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.debug("Unable to parse source connection JSON for %s: %s", source_type, exc)
                 parsed = {}
             path_value = parsed.get("path") or parsed.get("destination")
             if isinstance(path_value, str) and path_value:
@@ -273,12 +277,12 @@ def rag_build(
     console.print(f"Total chunks={stats['chunk_count']}, sources={stats['source_count']}")
 
 
-@app.command("index")
+@app.command("index", hidden=True)
 def index_alias(path: str = typer.Argument(".")) -> None:
     rag_build(path)
 
 
-@app.command("build")
+@app.command("build", hidden=True)
 def build_alias(path: str = typer.Argument(".")) -> None:
     rag_build(path)
 
@@ -444,7 +448,8 @@ def sync() -> None:
                 continue
             try:
                 config_data = json.loads(str(config_raw))
-            except Exception:
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.debug("Unable to parse connector config for %s: %s", source_type, exc)
                 config_data = {}
 
             if source_type == "google_drive":
@@ -562,7 +567,8 @@ def sources_list() -> None:
         if config_raw:
             try:
                 config = json.loads(str(config_raw))
-            except Exception:
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.debug("Unable to parse source list config JSON: %s", exc)
                 config = {}
         path_value = config.get("path") or config.get("destination") or "-"
         table.add_row(
@@ -683,7 +689,7 @@ def rag_status() -> None:
     console.print(by_source)
 
 
-@app.command("status")
+@app.command("status", hidden=True)
 def status_alias() -> None:
     rag_status()
 
@@ -938,7 +944,8 @@ def profile_command(
                     if "chunking_strategy" in line and "=" in line:
                         chunking = line.split("=", 1)[1].strip().strip('"').strip("'")
                 table.add_row(profile_id, embedding_model, chunking, status)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to read profile file %s: %s", pf, exc)
                 table.add_row(profile_id, "error", "error", "error")
 
         console.print(table)

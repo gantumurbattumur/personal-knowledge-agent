@@ -39,6 +39,9 @@ chunking = [
 query = [
   "pyspellchecker>=0.8.0",
 ]
+dev = [
+  "pytest>=8.0.0",
+]
 full = [
   "pypdf>=4.2.0",
   "docling>=2.0.0",
